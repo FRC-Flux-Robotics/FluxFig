@@ -1,0 +1,15 @@
+# Exclude build artifacts, Gradle cache, and heavy git objects while keeping <4KB git ref metadata
+# so manual `gcloud builds submit` resolves COMMIT_SHA, BRANCH_NAME, and GH_REPO automatically.
+build/
+.gradle/
+output/
+*.wpilog
+*.hoot
+.git/objects/**
+.git/logs/**
+.git/hooks/**
+!.git/HEAD
+!.git/config
+!.git/refs/**
+!.git/packed-refs
+!.git/reftable/**

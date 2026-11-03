@@ -1,0 +1,28 @@
+# GCP Cloud Build Pipeline for Standalone FluxFig Library (Java 17 Bytecode)
+#
+# Run manually:
+#   gcloud builds submit . \
+#     --config=cloudbuild.yaml
+
+steps:
+  - name: "eclipse-temurin:17-jdk-jammy"
+    id: "compile-test-and-package-fluxfig"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        chmod +x ./scripts/build.sh
+        ./scripts/build.sh
+
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+    id: "publish-fluxfig-jar-to-gcs"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        gcloud storage cp dist/fluxfig.jar gs://btvaroska/frc-10413/libs/fluxfig-latest.jar
+        gcloud storage cp dist/fluxfig.jar gs://btvaroska/frc-10413/libs/fluxfig-2027.1.0.jar
+        gcloud storage cp dist/fluxfig.jar gs://btvaroska/frc-10413/libs/fluxfig-1.0.0.jar
+        echo "Published gs://btvaroska/frc-10413/libs/fluxfig-latest.jar (v2027.1.0)"

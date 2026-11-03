@@ -1,0 +1,91 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'frc.flux'
+version = '2027.1.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release.set(17)
+    options.compilerArgs += ['-Xlint:all,-serial', '-Werror']
+}
+
+tasks.register('runFluxFigTests', JavaExec) {
+    group = 'verification'
+    description = 'Runs the zero-dependency FluxFigTest suite with assertions enabled.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'frc.lib.fluxfig.FluxFigTest'
+    enableAssertions = true
+}
+
+tasks.named('test') {
+    dependsOn tasks.named('runFluxFigTests')
+}
+
+tasks.register('pullFig', JavaExec) {
+    group = 'fluxfig'
+    description = 'Pulls and validates Google Sheet tabs into a target configDir (-PconfigDir=... [-PsheetId=...] [-Ptabs=...]).'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'frc.lib.fluxfig.FluxFigMain'
+    doFirst {
+        def targetDir = project.findProperty('configDir') ?: "${projectDir}/configs"
+        def cliArgs = ['pull', targetDir.toString()]
+        if (project.hasProperty('sheetId')) {
+            cliArgs.add(project.property('sheetId').toString())
+        }
+        if (project.hasProperty('tabs')) {
+            cliArgs.add(project.property('tabs').toString())
+        }
+        args = cliArgs
+    }
+}
+
+tasks.register('spotlessApply') {
+    group = 'formatting'
+    description = 'Normalizes UTF-8 LF line endings and trims trailing whitespace across Java source files.'
+    doLast {
+        fileTree('src').matching { include '**/*.java' }.each { File f ->
+            String original = f.getText('UTF-8')
+            String normalized = original.replace('\r\n', '\n').split('\n', -1).collect { it.replaceAll(/[ \t]+$/, '') }.join('\n')
+            if (!normalized.endsWith('\n')) {
+                normalized += '\n'
+            }
+            if (normalized != original) {
+                f.setText(normalized, 'UTF-8')
+            }
+        }
+    }
+}
+
+tasks.register('spotlessCheck') {
+    group = 'formatting'
+    description = 'Checks that Java source files have clean UTF-8 LF line endings.'
+    dependsOn 'spotlessApply'
+}
+
+jar {
+    archiveBaseName.set('fluxfig')
+    archiveVersion.set('1.0.0')
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+    manifest {
+        attributes(
+            'Main-Class': 'frc.lib.fluxfig.FluxFigMain',
+            'Implementation-Title': 'FluxFig',
+            'Implementation-Version': project.version
+        )
+    }
+    doLast {
+        copy {
+            from archiveFile
+            into file("${projectDir}/dist")
+            rename { 'fluxfig.jar' }
+        }
+    }
+}

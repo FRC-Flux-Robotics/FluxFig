@@ -1,0 +1,21 @@
+# Gradle & build outputs
+build/
+.gradle/
+output/
+
+# Compiled & temporary files
+*.class
+*.log
+*.wpilog
+*.hoot
+__pycache__/
+*.pyc
+.DS_Store
+*.swp
+*~
+hs_err_pid*
+replay_pid*
+
+# Explicitly keep committed standalone JAR & Gradle wrapper
+!dist/fluxfig.jar
+!gradle/wrapper/gradle-wrapper.jar
