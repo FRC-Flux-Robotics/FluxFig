@@ -65,8 +65,23 @@ tasks.register('spotlessApply') {
 
 tasks.register('spotlessCheck') {
     group = 'formatting'
-    description = 'Checks that Java source files have clean UTF-8 LF line endings.'
-    dependsOn 'spotlessApply'
+    description = 'Checks (read-only) that Java source files have clean UTF-8 LF line endings and no trailing whitespace.'
+    doLast {
+        List<String> dirty = []
+        fileTree('src').matching { include '**/*.java' }.each { File f ->
+            String original = f.getText('UTF-8')
+            String normalized = original.replace('\r\n', '\n').split('\n', -1).collect { it.replaceAll(/[ \t]+$/, '') }.join('\n')
+            if (!normalized.endsWith('\n')) {
+                normalized += '\n'
+            }
+            if (normalized != original) {
+                dirty.add(project.relativePath(f))
+            }
+        }
+        if (!dirty.isEmpty()) {
+            throw new GradleException("spotlessCheck failed on ${dirty.size()} file(s); run ./gradlew spotlessApply:\n  " + dirty.join('\n  '))
+        }
+    }
 }
 
 jar {
