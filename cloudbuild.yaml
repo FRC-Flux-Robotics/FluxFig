@@ -1,7 +1,9 @@
 # GCP Cloud Build Pipeline for Standalone FluxFig Library (Java 17 Bytecode)
 #
-# Run manually:
+# Run manually (uses gs://infra-2008 for staging & artifacts):
 #   gcloud builds submit . \
+#     --project=infra-2008 \
+#     --gcs-source-staging-dir=gs://infra-2008/_cloudbuild/source \
 #     --config=cloudbuild.yaml
 
 steps:
@@ -22,7 +24,10 @@ steps:
       - "-c"
       - |
         set -euo pipefail
-        gcloud storage cp dist/fluxfig.jar gs://btvaroska/frc-10413/libs/fluxfig-latest.jar
-        gcloud storage cp dist/fluxfig.jar gs://btvaroska/frc-10413/libs/fluxfig-2027.1.0.jar
-        gcloud storage cp dist/fluxfig.jar gs://btvaroska/frc-10413/libs/fluxfig-1.0.0.jar
-        echo "Published gs://btvaroska/frc-10413/libs/fluxfig-latest.jar (v2027.1.0)"
+        gcloud storage cp dist/fluxfig.jar gs://infra-2008/frc-10413/libs/fluxfig-latest.jar
+        gcloud storage cp dist/fluxfig.jar gs://infra-2008/frc-10413/libs/fluxfig-2027.1.0.jar
+        gcloud storage cp dist/fluxfig.jar gs://infra-2008/frc-10413/libs/fluxfig-1.0.0.jar
+        echo "Published gs://infra-2008/frc-10413/libs/fluxfig-latest.jar (v2027.1.0)"
+
+options:
+  logsBucket: "gs://infra-2008/_cloudbuild/logs"
