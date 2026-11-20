@@ -29,5 +29,4 @@ steps:
         gcloud storage cp dist/fluxfig.jar gs://infra-2008/frc-10413/libs/fluxfig-1.0.0.jar
         echo "Published gs://infra-2008/frc-10413/libs/fluxfig-latest.jar (v2027.1.0)"
 
-options:
-  logsBucket: "gs://infra-2008/_cloudbuild/logs"
+logsBucket: "gs://infra-2008/_cloudbuild/logs"
