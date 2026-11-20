@@ -1034,5 +1034,56 @@ public final class FluxFigTest {
             && Math.abs(parsed.getDoubleArraySeries("/FuelSim/Fuels").get(0).values()[4] - 5.6)
                 < 1e-6,
         "Expected struct:Translation3d[] 6 unpacked 3D coordinates");
+
+    // Verify FileChannel.read does not hold memory-mapped file locks blocking immediate deletion.
+    Files.delete(logFile);
+    check(!Files.exists(logFile), "Temp .wpilog must be immediately deletable after read()");
+
+    // Verify absent FluxSystemSnapshot metrics return NaN / NOT MEASURED instead of fake defaults.
+    check(
+        !FluxSystemSnapshot.REMOTE_CAPTURE_SH_COMMAND.contains("df -BM"),
+        "REMOTE_CAPTURE_SH_COMMAND must be BusyBox-safe (no GNU df -BM)");
+    FluxSystemSnapshot emptySnap = FluxSystemSnapshot.parse("");
+    check("UNKNOWN".equals(emptySnap.controllerType()), "Empty controllerType must be UNKNOWN");
+    check("NOT MEASURED".equals(emptySnap.hostname()), "Empty hostname must be NOT MEASURED");
+    check(Double.isNaN(emptySnap.cpuTempC()), "Absent cpuTempC must be NaN");
+    check(Double.isNaN(emptySnap.totalCpuPct()), "Absent totalCpuPct must be NaN");
+    check(Double.isNaN(emptySnap.freeStorageMb()), "Absent freeStorageMb must be NaN");
+    check(emptySnap.throttledFlags() == -1, "Absent throttledFlags must be -1");
+    check(
+        emptySnap.evaluate().isEmpty(),
+        "Empty snapshot must not trigger fabricated alerts: " + emptySnap.evaluate());
+    check(
+        "NOT MEASURED".equals(FluxSystemSnapshot.formatMetric(emptySnap.cpuTempC(), "%.1f", " C")),
+        "formatMetric must render NaN as NOT MEASURED");
+
+    // Verify roboRIO snapshot omits ZGC advice on GC loop spikes and preserves real low storage.
+    FluxSystemSnapshot rioSnap =
+        FluxSystemSnapshot.parse(
+            """
+            [PLATFORM]
+            controllerType=ROBORIO
+            hostname=roboRIO-10413-FRC
+            [CPU_AND_IRQ]
+            totalCpuPct=34.5
+            [JVM_AND_STORAGE]
+            gcCorrelatedLoopSpikes=2
+            freeStorageMb=120.0
+            """);
+    check(Double.isNaN(rioSnap.cpuTempC()), "Unmeasured roboRIO cpuTempC stays NaN");
+    check(
+        !rioSnap.serialize().contains("cpuTempC="),
+        "serialize() must omit unmeasured NaN fields");
+    List<FluxSystemSnapshot.WatchDecision> rioDecisions = rioSnap.evaluate();
+    check(rioDecisions.size() == 2, "Expected GC + storage alerts on roboRIO, got " + rioDecisions);
+    FluxSystemSnapshot.WatchDecision gcDecision =
+        rioDecisions.stream()
+            .filter(d -> d.metricName().contains("GC Pause"))
+            .findFirst()
+            .orElseThrow();
+    check(
+        !gcDecision.actionableDecision().contains("UseZGC")
+            && gcDecision.actionableDecision().contains("UseSerialGC"),
+        "roboRIO GC advice must never recommend 64-bit ZGC: " + gcDecision.actionableDecision());
   }
 }

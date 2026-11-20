@@ -72,22 +72,25 @@ public record FluxSystemSnapshot(
       String actionableDecision) {}
 
   /**
-   * Single non-intrusive shell command executed over SSH after a run to capture Linux {@code /proc}
-   * and {@code /sys} counters on SystemCore or roboRIO without touching robot Java code.
+   * Single non-intrusive BusyBox-safe shell command executed over SSH after a run to capture Linux
+   * {@code /proc} and {@code /sys} counters on SystemCore or roboRIO without touching robot Java
+   * code.
    */
   public static final String REMOTE_CAPTURE_SH_COMMAND =
       "echo '[PLATFORM]'; "
-          + "if [ -d /home/systemcore ] || ip link show can_s0 >/dev/null 2>&1; then echo 'controllerType=SYSTEMCORE'; else echo 'controllerType=ROBORIO'; fi; "
-          + "echo \"hostname=$(hostname 2>/dev/null || echo unknown)\"; "
-          + "echo \"kernelVersion=$(uname -r 2>/dev/null || echo unknown)\"; "
+          + "if [ -d /home/systemcore ] || ip link show can_s0 >/dev/null 2>&1; then echo 'controllerType=SYSTEMCORE'; "
+          + "elif [ -d /home/lvuser ] || [ -f /etc/natinst/share/ni-rt.ini ]; then echo 'controllerType=ROBORIO'; "
+          + "else echo 'controllerType=UNKNOWN'; fi; "
+          + "echo \"hostname=$(hostname 2>/dev/null || echo 'NOT MEASURED')\"; "
+          + "echo \"kernelVersion=$(uname -r 2>/dev/null || echo 'NOT MEASURED')\"; "
           + "awk '{print \"uptimeSec=\"$1}' /proc/uptime 2>/dev/null || true; "
           + "echo '[CPU_AND_IRQ]'; "
           + "awk '/^cpu / {total=$2+$3+$4+$5+$6+$7+$8; if (total>0) {printf \"totalCpuPct=%.1f\\nioWaitPct=%.1f\\nhardIrqPct=%.1f\\nsoftIrqPct=%.1f\\n\", (total-$5)*100.0/total, $6*100.0/total, $7*100.0/total, $8*100.0/total}}' /proc/stat 2>/dev/null || true; "
-          + "ps -eo pcpu,comm 2>/dev/null | awk '/java/ {j+=$1} /limelight|photon/ {v+=$1} END {if (j>0) printf \"javaProcessCpuPct=%.1f\\n\", j; if (v>0) printf \"visionDaemonCpuPct=%.1f\\n\", v}' || true; "
+          + "if ps -eo pcpu,comm >/dev/null 2>&1; then ps -eo pcpu,comm 2>/dev/null | awk '$1 ~ /^[0-9]+(\\.[0-9]+)?$/ {if ($2 ~ /java/) j+=$1; if ($2 ~ /limelight|photon/) v+=$1} END {if (j>0) printf \"javaProcessCpuPct=%.1f\\n\", j; if (v>0) printf \"visionDaemonCpuPct=%.1f\\n\", v}'; fi; "
           + "echo '[THERMAL_AND_POWER]'; "
           + "if [ -f /sys/class/thermal/thermal_zone0/temp ]; then awk '{printf \"cpuTempC=%.1f\\n\", $1/1000.0}' /sys/class/thermal/thermal_zone0/temp; fi; "
           + "if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then awk '{printf \"cpuFreqMHz=%.0f\\n\", $1/1000.0}' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq; fi; "
-          + "vcgencmd get_throttled 2>/dev/null | sed 's/throttled=/throttledHex=/' || true; "
+          + "if command -v vcgencmd >/dev/null 2>&1; then vcgencmd get_throttled 2>/dev/null | sed 's/throttled=/throttledHex=/' || true; fi; "
           + "echo '[SOCKETCAN]'; "
           + "for d in /sys/class/net/can_*; do "
           + "  [ -e \"$d\" ] || continue; "
@@ -97,11 +100,19 @@ public record FluxSystemSnapshot(
           + "  rxd=$(cat \"$d/statistics/rx_dropped\" 2>/dev/null || echo 0); "
           + "  txd=$(cat \"$d/statistics/tx_dropped\" 2>/dev/null || echo 0); "
           + "  rxo=$(cat \"$d/statistics/rx_over_errors\" 2>/dev/null || echo 0); "
-          + "  st=$(ip -d link show \"$b\" 2>/dev/null | awk '/can state/ {for(i=1;i<=NF;i++) if($i==\"state\") print $(i+1)}'); "
-          + "  echo \"can.${b}=${rxp},${txp},${rxd},${txd},${rxo},0,0,${st:-ERROR-ACTIVE}\"; "
+          + "  ipout=$(ip -d -s link show \"$b\" 2>/dev/null || true); "
+          + "  st=$(printf '%s\\n' \"$ipout\" | awk '/can state/ {for(i=1;i<=NF;i++) if($i==\"state\") {print $(i+1); exit}}'); "
+          + "  berr=$(printf '%s\\n' \"$ipout\" | awk '/berr-counter/ {tx=0; rx=0; for(i=1;i<=NF;i++) {if($i==\"tx\") tx=$(i+1)+0; if($i==\"rx\") rx=$(i+1)+0} print tx+rx; exit}'); "
+          + "  rst=$(printf '%s\\n' \"$ipout\" | awk '/restarts/ {getline; print $6+0; exit}'); "
+          + "  echo \"can.${b}=${rxp},${txp},${rxd},${txd},${rxo},${berr:-0},${rst:-0},${st:-UNKNOWN}\"; "
           + "done; "
           + "echo '[STORAGE]'; "
-          + "df -BM /U/logs /home/systemcore /home/lvuser 2>/dev/null | awk 'NR==2 {gsub(/M/,\"\",$4); print \"freeStorageMb=\"$4}' || true";
+          + "for d in /U/logs /home/systemcore /home/lvuser /; do "
+          + "  if [ -d \"$d\" ]; then "
+          + "    df -k \"$d\" 2>/dev/null | awk 'NR>1 && NF>=4 {avail=$(NF-2)} END {if (avail ~ /^[0-9]+$/) printf \"freeStorageMb=%.1f\\n\", avail/1024.0}'; "
+          + "    break; "
+          + "  fi; "
+          + "done";
 
   /** Creates a nominal healthy SystemCore baseline snapshot. */
   public static FluxSystemSnapshot healthySystemCoreBaseline() {
@@ -150,42 +161,46 @@ public record FluxSystemSnapshot(
         cans);
   }
 
-  /** Serializes this snapshot into the canonical {@code system-snapshot.txt} format. */
+  /**
+   * Serializes this snapshot into the canonical {@code system-snapshot.txt} format, omitting
+   * unmeasured ({@code NaN} / negative counter) fields so absent metrics are never fabricated.
+   */
   public String serialize() {
     StringBuilder sb = new StringBuilder(1024);
     sb.append("# FLUX 10413 Offline System & Controller Snapshot\n");
     sb.append("[PLATFORM]\n");
-    sb.append("controllerType=").append(controllerType).append('\n');
-    sb.append("hostname=").append(hostname).append('\n');
-    sb.append("kernelVersion=").append(kernelVersion).append('\n');
-    sb.append(String.format(Locale.US, "uptimeSec=%.1f\n", uptimeSec));
+    appendStringLine(sb, "controllerType", controllerType);
+    appendStringLine(sb, "hostname", hostname);
+    appendStringLine(sb, "kernelVersion", kernelVersion);
+    appendDoubleLine(sb, "uptimeSec", "%.1f", uptimeSec);
 
     sb.append("\n[LOOP_AND_TIMING]\n");
-    sb.append(String.format(Locale.US, "loopPeriodMs=%.2f\n", loopPeriodMs));
-    sb.append(String.format(Locale.US, "loopMedianMs=%.2f\n", loopMedianMs));
-    sb.append(String.format(Locale.US, "loopP99Ms=%.2f\n", loopP99Ms));
-    sb.append(String.format(Locale.US, "loopMaxMs=%.2f\n", loopMaxMs));
-    sb.append(String.format(Locale.US, "firstEnablePeakMs=%.2f\n", firstEnablePeakMs));
-    sb.append(String.format(Locale.US, "odometryJitterMaxMs=%.2f\n", odometryJitterMaxMs));
-    sb.append(String.format(Locale.US, "driveTraceMaxMs=%.2f\n", driveTraceMaxMs));
-    sb.append(String.format(Locale.US, "visionTraceMaxMs=%.2f\n", visionTraceMaxMs));
-    sb.append(
-        String.format(Locale.US, "superstructureTraceMaxMs=%.2f\n", superstructureTraceMaxMs));
+    appendDoubleLine(sb, "loopPeriodMs", "%.2f", loopPeriodMs);
+    appendDoubleLine(sb, "loopMedianMs", "%.2f", loopMedianMs);
+    appendDoubleLine(sb, "loopP99Ms", "%.2f", loopP99Ms);
+    appendDoubleLine(sb, "loopMaxMs", "%.2f", loopMaxMs);
+    appendDoubleLine(sb, "firstEnablePeakMs", "%.2f", firstEnablePeakMs);
+    appendDoubleLine(sb, "odometryJitterMaxMs", "%.2f", odometryJitterMaxMs);
+    appendDoubleLine(sb, "driveTraceMaxMs", "%.2f", driveTraceMaxMs);
+    appendDoubleLine(sb, "visionTraceMaxMs", "%.2f", visionTraceMaxMs);
+    appendDoubleLine(sb, "superstructureTraceMaxMs", "%.2f", superstructureTraceMaxMs);
 
     sb.append("\n[CPU_AND_IRQ]\n");
-    sb.append(String.format(Locale.US, "totalCpuPct=%.1f\n", totalCpuPct));
-    sb.append(String.format(Locale.US, "javaProcessCpuPct=%.1f\n", javaProcessCpuPct));
-    sb.append(String.format(Locale.US, "visionDaemonCpuPct=%.1f\n", visionDaemonCpuPct));
-    sb.append(String.format(Locale.US, "softIrqPct=%.1f\n", softIrqPct));
-    sb.append(String.format(Locale.US, "hardIrqPct=%.1f\n", hardIrqPct));
-    sb.append(String.format(Locale.US, "ioWaitPct=%.1f\n", ioWaitPct));
-    sb.append("spiCanIrqCount=").append(spiCanIrqCount).append('\n');
-    sb.append("usbXhciIrqCount=").append(usbXhciIrqCount).append('\n');
+    appendDoubleLine(sb, "totalCpuPct", "%.1f", totalCpuPct);
+    appendDoubleLine(sb, "javaProcessCpuPct", "%.1f", javaProcessCpuPct);
+    appendDoubleLine(sb, "visionDaemonCpuPct", "%.1f", visionDaemonCpuPct);
+    appendDoubleLine(sb, "softIrqPct", "%.1f", softIrqPct);
+    appendDoubleLine(sb, "hardIrqPct", "%.1f", hardIrqPct);
+    appendDoubleLine(sb, "ioWaitPct", "%.1f", ioWaitPct);
+    appendLongLine(sb, "spiCanIrqCount", spiCanIrqCount);
+    appendLongLine(sb, "usbXhciIrqCount", usbXhciIrqCount);
 
     sb.append("\n[THERMAL_AND_POWER]\n");
-    sb.append(String.format(Locale.US, "cpuTempC=%.1f\n", cpuTempC));
-    sb.append(String.format(Locale.US, "cpuFreqMHz=%.0f\n", cpuFreqMHz));
-    sb.append(String.format(Locale.US, "throttledHex=0x%x\n", throttledFlags));
+    appendDoubleLine(sb, "cpuTempC", "%.1f", cpuTempC);
+    appendDoubleLine(sb, "cpuFreqMHz", "%.0f", cpuFreqMHz);
+    if (throttledFlags >= 0) {
+      sb.append(String.format(Locale.US, "throttledHex=0x%x\n", throttledFlags));
+    }
 
     sb.append("\n[SOCKETCAN]\n");
     for (CanInterfaceStats c : canInterfaces) {
@@ -211,22 +226,26 @@ public record FluxSystemSnapshot(
     }
 
     sb.append("\n[JVM_AND_STORAGE]\n");
-    sb.append(String.format(Locale.US, "heapAllocRateMbPerSec=%.2f\n", heapAllocRateMbPerSec));
-    sb.append("gcCount=").append(gcCount).append('\n');
-    sb.append(String.format(Locale.US, "gcTotalPauseMs=%.2f\n", gcTotalPauseMs));
-    sb.append("gcCorrelatedLoopSpikes=").append(gcCorrelatedLoopSpikes).append('\n');
-    sb.append(String.format(Locale.US, "freeStorageMb=%.1f\n", freeStorageMb));
-    sb.append(String.format(Locale.US, "logWriteLatencyMaxMs=%.2f\n", logWriteLatencyMaxMs));
+    appendDoubleLine(sb, "heapAllocRateMbPerSec", "%.2f", heapAllocRateMbPerSec);
+    appendLongLine(sb, "gcCount", gcCount);
+    appendDoubleLine(sb, "gcTotalPauseMs", "%.2f", gcTotalPauseMs);
+    appendLongLine(sb, "gcCorrelatedLoopSpikes", gcCorrelatedLoopSpikes);
+    appendDoubleLine(sb, "freeStorageMb", "%.1f", freeStorageMb);
+    appendDoubleLine(sb, "logWriteLatencyMaxMs", "%.2f", logWriteLatencyMaxMs);
 
     sb.append("\n[HARDWARE_PMU]\n");
-    sb.append(String.format(Locale.US, "ipc=%.2f\n", ipc));
-    sb.append(String.format(Locale.US, "l1dCacheMissPct=%.2f\n", l1dCacheMissPct));
-    sb.append(String.format(Locale.US, "llcMissPct=%.2f\n", llcMissPct));
-    sb.append("involuntaryContextSwitches=").append(involuntaryContextSwitches).append('\n');
+    appendDoubleLine(sb, "ipc", "%.2f", ipc);
+    appendDoubleLine(sb, "l1dCacheMissPct", "%.2f", l1dCacheMissPct);
+    appendDoubleLine(sb, "llcMissPct", "%.2f", llcMissPct);
+    appendLongLine(sb, "involuntaryContextSwitches", involuntaryContextSwitches);
     return sb.toString();
   }
 
-  /** Parses {@code system-snapshot.txt} text into a structured {@link FluxSystemSnapshot}. */
+  /**
+   * Parses {@code system-snapshot.txt} text into a structured {@link FluxSystemSnapshot}. Absent
+   * numeric metrics return {@link Double#NaN} (or {@code -1} for integer counters) and absent
+   * strings return {@code "NOT MEASURED"} (or {@code "UNKNOWN"} for {@code controllerType}).
+   */
   public static FluxSystemSnapshot parse(String rawText) {
     Map<String, String> kv = new LinkedHashMap<>();
     List<CanInterfaceStats> cans = new ArrayList<>();
@@ -264,56 +283,79 @@ public record FluxSystemSnapshot(
       }
     }
 
-    String controllerType = kv.getOrDefault("controllerType", "SYSTEMCORE");
-    double defaultPeriod = "ROBORIO".equalsIgnoreCase(controllerType) ? 20.0 : 5.0;
-    double defaultFreq = "ROBORIO".equalsIgnoreCase(controllerType) ? 667.0 : 2400.0;
+    String controllerType = nonBlankOrDefault(kv.get("controllerType"), "UNKNOWN");
 
     return new FluxSystemSnapshot(
         controllerType,
-        kv.getOrDefault("hostname", "SystemCore-10413"),
-        kv.getOrDefault("kernelVersion", "6.6.47-rt39"),
-        parseDouble(kv.get("uptimeSec"), 0.0),
-        parseDouble(kv.get("loopPeriodMs"), defaultPeriod),
-        parseDouble(kv.get("loopMedianMs"), 1.5),
-        parseDouble(kv.get("loopP99Ms"), 2.8),
-        parseDouble(kv.get("loopMaxMs"), 4.1),
-        parseDouble(kv.get("firstEnablePeakMs"), 3.9),
-        parseDouble(kv.get("odometryJitterMaxMs"), 0.4),
-        parseDouble(kv.get("driveTraceMaxMs"), 0.5),
-        parseDouble(kv.get("visionTraceMaxMs"), 0.6),
-        parseDouble(kv.get("superstructureTraceMaxMs"), 0.3),
-        parseDouble(kv.get("totalCpuPct"), 40.0),
-        parseDouble(kv.get("javaProcessCpuPct"), 12.0),
-        parseDouble(kv.get("visionDaemonCpuPct"), 24.0),
-        parseDouble(kv.get("softIrqPct"), 4.5),
-        parseDouble(kv.get("hardIrqPct"), 1.2),
-        parseDouble(kv.getOrDefault("ioWaitPct", kv.get("iowaitPct")), 0.4),
-        parseLong(kv.get("spiCanIrqCount"), 0L),
-        parseLong(kv.get("usbXhciIrqCount"), 0L),
-        parseDouble(kv.get("cpuTempC"), 55.0),
-        parseDouble(kv.get("cpuFreqMHz"), defaultFreq),
-        parseHexOrInt(kv.get("throttledHex"), 0),
-        parseDouble(kv.get("heapAllocRateMbPerSec"), 0.2),
-        (int) parseLong(kv.get("gcCount"), 0L),
-        parseDouble(kv.get("gcTotalPauseMs"), 0.0),
-        (int) parseLong(kv.get("gcCorrelatedLoopSpikes"), 0L),
-        parseDouble(kv.get("freeStorageMb"), 1024.0),
-        parseDouble(kv.get("logWriteLatencyMaxMs"), 2.0),
-        parseDouble(kv.get("ipc"), 1.4),
-        parseDouble(kv.get("l1dCacheMissPct"), 1.8),
-        parseDouble(kv.get("llcMissPct"), 3.2),
-        parseLong(kv.get("involuntaryContextSwitches"), 10L),
+        nonBlankOrDefault(kv.get("hostname"), "NOT MEASURED"),
+        nonBlankOrDefault(kv.get("kernelVersion"), "NOT MEASURED"),
+        parseDoubleOrNaN(kv.get("uptimeSec")),
+        parseDoubleOrNaN(kv.get("loopPeriodMs")),
+        parseDoubleOrNaN(kv.get("loopMedianMs")),
+        parseDoubleOrNaN(kv.get("loopP99Ms")),
+        parseDoubleOrNaN(kv.get("loopMaxMs")),
+        parseDoubleOrNaN(kv.get("firstEnablePeakMs")),
+        parseDoubleOrNaN(kv.get("odometryJitterMaxMs")),
+        parseDoubleOrNaN(kv.get("driveTraceMaxMs")),
+        parseDoubleOrNaN(kv.get("visionTraceMaxMs")),
+        parseDoubleOrNaN(kv.get("superstructureTraceMaxMs")),
+        parseDoubleOrNaN(kv.get("totalCpuPct")),
+        parseDoubleOrNaN(kv.get("javaProcessCpuPct")),
+        parseDoubleOrNaN(kv.get("visionDaemonCpuPct")),
+        parseDoubleOrNaN(kv.get("softIrqPct")),
+        parseDoubleOrNaN(kv.get("hardIrqPct")),
+        parseDoubleOrNaN(kv.getOrDefault("ioWaitPct", kv.get("iowaitPct"))),
+        parseLong(kv.get("spiCanIrqCount"), -1L),
+        parseLong(kv.get("usbXhciIrqCount"), -1L),
+        parseDoubleOrNaN(kv.get("cpuTempC")),
+        parseDoubleOrNaN(kv.get("cpuFreqMHz")),
+        parseHexOrInt(kv.get("throttledHex"), -1),
+        parseDoubleOrNaN(kv.get("heapAllocRateMbPerSec")),
+        (int) parseLong(kv.get("gcCount"), -1L),
+        parseDoubleOrNaN(kv.get("gcTotalPauseMs")),
+        (int) parseLong(kv.get("gcCorrelatedLoopSpikes"), -1L),
+        parseDoubleOrNaN(kv.get("freeStorageMb")),
+        parseDoubleOrNaN(kv.get("logWriteLatencyMaxMs")),
+        parseDoubleOrNaN(kv.get("ipc")),
+        parseDoubleOrNaN(kv.get("l1dCacheMissPct")),
+        parseDoubleOrNaN(kv.get("llcMissPct")),
+        parseLong(kv.get("involuntaryContextSwitches"), -1L),
         Collections.unmodifiableList(cans));
+  }
+
+  /** Formats a double metric or returns {@code "NOT MEASURED"} when {@code NaN}/infinite. */
+  public static String formatMetric(double value, String formatPattern, String suffix) {
+    if (!Double.isFinite(value)) {
+      return "NOT MEASURED";
+    }
+    return String.format(Locale.US, formatPattern, value) + (suffix != null ? suffix : "");
+  }
+
+  /** Formats a non-negative integer counter or returns {@code "NOT MEASURED"} when absent. */
+  public static String formatCounter(long value, String suffix) {
+    if (value < 0) {
+      return "NOT MEASURED";
+    }
+    return value + (suffix != null ? suffix : "");
+  }
+
+  /** Formats a non-negative hex bitmask or returns {@code "NOT MEASURED"} when absent. */
+  public static String formatHexFlags(int value) {
+    if (value < 0) {
+      return "NOT MEASURED";
+    }
+    return String.format(Locale.US, "0x%x", value);
   }
 
   /** Evaluates all 14 offline watch metrics on this snapshot. */
   public List<WatchDecision> evaluate() {
-    return evaluate(this, true, true);
+    return evaluate(this, true, Double.isFinite(freeStorageMb));
   }
 
   /**
    * Evaluates all 14 offline watch metrics across 6 categories and maps every detected anomaly to a
-   * concrete engineering, {@code FluxFig} CSV, or pit maintenance decision.
+   * concrete engineering, {@code FluxFig} CSV, or pit maintenance decision. Unmeasured ({@code
+   * NaN} / negative counter) fields are skipped honestly rather than triggering false alerts.
    *
    * @param s parsed or synthesized {@link FluxSystemSnapshot}
    * @param hasSnapshotFile whether a physical {@code system-snapshot.txt} file was present
@@ -322,49 +364,64 @@ public record FluxSystemSnapshot(
   public static List<WatchDecision> evaluate(
       FluxSystemSnapshot s, boolean hasSnapshotFile, boolean evaluateStorage) {
     List<WatchDecision> out = new ArrayList<>();
+    boolean isRoboRio =
+        s.controllerType() != null
+            && s.controllerType().toUpperCase(Locale.ROOT).contains("ROBORIO");
+    double effectivePeriodMs =
+        Double.isFinite(s.loopPeriodMs()) && s.loopPeriodMs() > 0.0
+            ? s.loopPeriodMs()
+            : (isRoboRio ? 20.0 : 5.0);
 
-    double p99LimitMs = s.loopPeriodMs() * 1.30; // 6.5 ms @ 200 Hz, 26.0 ms @ 50 Hz
-    if (s.loopP99Ms() > p99LimitMs) {
+    double p99LimitMs = effectivePeriodMs * 1.30; // 6.5 ms @ 200 Hz, 26.0 ms @ 50 Hz
+    if (Double.isFinite(s.loopP99Ms()) && s.loopP99Ms() > p99LimitMs) {
+      String loopDecision =
+          (isRoboRio || effectivePeriodMs >= 15.0)
+              ? "Decision: Profile subsystem periodic() traces in AdvantageScope and move blocking CAN/vision work off the 50 Hz roboRIO main thread."
+              : "Decision: Change loopPeriodMs in parameters.csv (FluxFig) from 5 ms (200 Hz) to 10 ms (100 Hz) so ChassisSpeeds.discretize() and PID dt stay deterministic.";
       out.add(
           new WatchDecision(
               "1. Loop & Thread Timing",
               "Loop Period Jitter (p99 Δt)",
               String.format(
-                  Locale.US, "p99=%.2f ms (max=%.2f ms)", s.loopP99Ms(), s.loopMaxMs()),
+                  Locale.US,
+                  "p99=%s (max=%s)",
+                  formatMetric(s.loopP99Ms(), "%.2f", " ms"),
+                  formatMetric(s.loopMaxMs(), "%.2f", " ms")),
               String.format(Locale.US, "<= %.2f ms", p99LimitMs),
-              s.loopP99Ms() > s.loopPeriodMs() * 1.75 ? "CRITICAL" : "WARN",
+              s.loopP99Ms() > effectivePeriodMs * 1.75 ? "CRITICAL" : "WARN",
               String.format(
                   Locale.US,
                   "Control loop p99 (%.2f ms) exceeded %.0f Hz budget (%.1f ms period).",
                   s.loopP99Ms(),
-                  1000.0 / s.loopPeriodMs(),
-                  s.loopPeriodMs()),
-              "Decision: Change loopPeriodMs in parameters.csv (FluxFig) from 5 ms (200 Hz) to 10 ms (100 Hz) so ChassisSpeeds.discretize() and PID dt stay deterministic."));
+                  1000.0 / effectivePeriodMs,
+                  effectivePeriodMs),
+              loopDecision));
     }
 
-    if (s.visionTraceMaxMs() > 2.5
-        || s.driveTraceMaxMs() > 2.0
-        || s.superstructureTraceMaxMs() > 1.5) {
+    boolean visionHigh = Double.isFinite(s.visionTraceMaxMs()) && s.visionTraceMaxMs() > 2.5;
+    boolean driveHigh = Double.isFinite(s.driveTraceMaxMs()) && s.driveTraceMaxMs() > 2.0;
+    boolean superHigh =
+        Double.isFinite(s.superstructureTraceMaxMs()) && s.superstructureTraceMaxMs() > 1.5;
+    if (visionHigh || driveHigh || superHigh) {
+      double vVal = Double.isFinite(s.visionTraceMaxMs()) ? s.visionTraceMaxMs() : -1.0;
+      double dVal = Double.isFinite(s.driveTraceMaxMs()) ? s.driveTraceMaxMs() : -1.0;
+      double suVal =
+          Double.isFinite(s.superstructureTraceMaxMs()) ? s.superstructureTraceMaxMs() : -1.0;
       String culprit =
-          s.visionTraceMaxMs() >= s.driveTraceMaxMs()
-                  && s.visionTraceMaxMs() >= s.superstructureTraceMaxMs()
+          vVal >= dVal && vVal >= suVal
               ? "VisionMs"
-              : (s.driveTraceMaxMs() >= s.superstructureTraceMaxMs()
-                  ? "DriveMs"
-                  : "SuperstructureMs");
-      double peak =
-          Math.max(
-              s.visionTraceMaxMs(), Math.max(s.driveTraceMaxMs(), s.superstructureTraceMaxMs()));
+              : (dVal >= suVal ? "DriveMs" : "SuperstructureMs");
+      double peak = Math.max(vVal, Math.max(dVal, suVal));
       out.add(
           new WatchDecision(
               "1. Loop & Thread Timing",
               "Per-Subsystem Execution Breakdown (" + culprit + ")",
               String.format(
                   Locale.US,
-                  "Drive=%.2f ms, Vision=%.2f ms, Super=%.2f ms",
-                  s.driveTraceMaxMs(),
-                  s.visionTraceMaxMs(),
-                  s.superstructureTraceMaxMs()),
+                  "Drive=%s, Vision=%s, Super=%s",
+                  formatMetric(s.driveTraceMaxMs(), "%.2f", " ms"),
+                  formatMetric(s.visionTraceMaxMs(), "%.2f", " ms"),
+                  formatMetric(s.superstructureTraceMaxMs(), "%.2f", " ms")),
               "Drive <= 2.0 ms, Vision <= 2.5 ms, Super <= 1.5 ms",
               peak > 4.0 ? "CRITICAL" : "WARN",
               culprit
@@ -376,9 +433,11 @@ public record FluxSystemSnapshot(
                   : "Decision: Move synchronous CTRE configurator .apply() calls out of periodic() into init or async background worker."));
     }
 
-    if (s.firstEnablePeakMs() > Math.max(12.0, s.loopPeriodMs() * 2.4)
+    if (Double.isFinite(s.firstEnablePeakMs())
+        && Double.isFinite(s.loopMedianMs())
+        && s.firstEnablePeakMs() > Math.max(12.0, effectivePeriodMs * 2.4)
         && s.loopMedianMs() > 0.0
-        && s.loopMedianMs() < s.loopPeriodMs() * 0.7) {
+        && s.loopMedianMs() < effectivePeriodMs * 0.7) {
       out.add(
           new WatchDecision(
               "1. Loop & Thread Timing",
@@ -394,7 +453,7 @@ public record FluxSystemSnapshot(
               "Decision: Add dummy warmup iterations for PathPlanner trajectory follower, ShotCalculator, and ZeroPriorBootstrapSolver inside robotInit()."));
     }
 
-    if (s.odometryJitterMaxMs() > 1.5) {
+    if (Double.isFinite(s.odometryJitterMaxMs()) && s.odometryJitterMaxMs() > 1.5) {
       out.add(
           new WatchDecision(
               "1. Loop & Thread Timing",
@@ -403,7 +462,9 @@ public record FluxSystemSnapshot(
               "<= ±1.50 ms",
               s.odometryJitterMaxMs() > 2.5 ? "CRITICAL" : "WARN",
               "250 Hz PhoenixOdometryThread experienced scheduling jitter.",
-              "Decision: Pin PhoenixOdometryThread to Core 3 (taskset -c 3) away from Linux USB/Network interrupt handlers on Core 0."));
+              isRoboRio
+                  ? "Decision: Verify CANivore USB bandwidth and lower non-critical TalonFX status frame rates on Drivetrain bus."
+                  : "Decision: Pin PhoenixOdometryThread to Core 3 (taskset -c 3) away from Linux USB/Network interrupt handlers on Core 0."));
     }
 
     for (CanInterfaceStats can : s.canInterfaces()) {
@@ -448,7 +509,8 @@ public record FluxSystemSnapshot(
 
       boolean badState =
           !"ERROR-ACTIVE".equalsIgnoreCase(can.canState())
-              && !"UNKNOWN".equalsIgnoreCase(can.canState());
+              && !"UNKNOWN".equalsIgnoreCase(can.canState())
+              && !"NOT MEASURED".equalsIgnoreCase(can.canState());
       if (badState || can.busErrorCount() > 0 || can.busRestarts() > 0) {
         out.add(
             new WatchDecision(
@@ -473,60 +535,72 @@ public record FluxSystemSnapshot(
       }
     }
 
-    if (s.softIrqPct() > 25.0) {
+    if (Double.isFinite(s.softIrqPct()) && s.softIrqPct() > 25.0) {
       out.add(
           new WatchDecision(
               "2. SocketCAN & SPI Bus",
               "Kernel softirq & SPI Interrupt Load",
               String.format(
-                  Locale.US, "softirq=%.1f%%, hardirq=%.1f%%", s.softIrqPct(), s.hardIrqPct()),
+                  Locale.US,
+                  "softirq=%s, hardirq=%s",
+                  formatMetric(s.softIrqPct(), "%.1f", "%"),
+                  formatMetric(s.hardIrqPct(), "%.1f", "%")),
               "softirq <= 25.0%",
               s.softIrqPct() > 35.0 ? "CRITICAL" : "WARN",
               "Linux kernel softirq processing (SPI SocketCAN + USB UVC cameras) is saturating CPU0.",
               "Decision: Balance CAN status frame rates or lower OV9281 USB camera capture rate from 90 FPS -> 60 FPS."));
     }
 
-    if (s.totalCpuPct() > 80.0 && s.javaProcessCpuPct() < 30.0) {
+    if (Double.isFinite(s.totalCpuPct())
+        && Double.isFinite(s.javaProcessCpuPct())
+        && s.totalCpuPct() > 80.0
+        && s.javaProcessCpuPct() < 30.0) {
       out.add(
           new WatchDecision(
               "3. CPU, Vision & Thermal",
               "Java CPU % vs. Native Vision Daemon CPU %",
               String.format(
                   Locale.US,
-                  "Total=%.1f%% (Java=%.1f%%, Vision C++=%.1f%%)",
-                  s.totalCpuPct(),
-                  s.javaProcessCpuPct(),
-                  s.visionDaemonCpuPct()),
+                  "Total=%s (Java=%s, Vision C++=%s)",
+                  formatMetric(s.totalCpuPct(), "%.1f", "%"),
+                  formatMetric(s.javaProcessCpuPct(), "%.1f", "%"),
+                  formatMetric(s.visionDaemonCpuPct(), "%.1f", "%")),
               "Total CPU <= 80.0%",
               "WARN",
               "Native C++ limelightsc0..3 AprilTag daemons (not Java robot code) are saturating the Cortex-A76 cores.",
               "Decision: Enable 2x detector decimation during Teleop or reduce camera FPS in cameras.csv."));
     }
 
-    boolean thermalThrottled = (s.throttledFlags() & 0x40004) != 0;
+    boolean hasThrottled = s.throttledFlags() >= 0;
+    boolean thermalThrottled = hasThrottled && (s.throttledFlags() & 0x40004) != 0;
     boolean freqThrottled =
         hasSnapshotFile
             && "SYSTEMCORE".equalsIgnoreCase(s.controllerType())
+            && Double.isFinite(s.cpuFreqMHz())
             && s.cpuFreqMHz() > 0.0
             && s.cpuFreqMHz() < 2000.0;
-    if (s.cpuTempC() >= 80.0 || thermalThrottled || freqThrottled) {
+    boolean tempHigh = Double.isFinite(s.cpuTempC()) && s.cpuTempC() >= 80.0;
+    if (tempHigh || thermalThrottled || freqThrottled) {
       out.add(
           new WatchDecision(
               "3. CPU, Vision & Thermal",
               "CPU Die Temperature & CM5 Thermal Throttling",
               String.format(
                   Locale.US,
-                  "%.1f °C @ %.0f MHz (throttled=0x%x)",
-                  s.cpuTempC(),
-                  s.cpuFreqMHz(),
-                  s.throttledFlags()),
+                  "%s @ %s (throttled=%s)",
+                  formatMetric(s.cpuTempC(), "%.1f", " °C"),
+                  formatMetric(s.cpuFreqMHz(), "%.0f", " MHz"),
+                  formatHexFlags(s.throttledFlags())),
               "< 80.0 °C, 2400 MHz, 0x0",
-              s.cpuTempC() >= 85.0 || (s.throttledFlags() & 0x4) != 0 ? "CRITICAL" : "WARN",
-              "CM5 SoC reached thermal throttle threshold inside electronics enclosure.",
-              "Decision: Add a 5V pit cooling fan over SystemCore heatsink or throttle idle camera processing while Disabled after PreMatchCalibrator locks."));
+              (Double.isFinite(s.cpuTempC()) && s.cpuTempC() >= 85.0)
+                      || (hasThrottled && (s.throttledFlags() & 0x4) != 0)
+                  ? "CRITICAL"
+                  : "WARN",
+              "SoC reached thermal throttle threshold inside electronics enclosure.",
+              "Decision: Add a cooling fan over controller heatsink or throttle idle camera processing while Disabled after PreMatchCalibrator locks."));
     }
 
-    boolean underVoltage = (s.throttledFlags() & 0x10001) != 0;
+    boolean underVoltage = hasThrottled && (s.throttledFlags() & 0x10001) != 0;
     if (underVoltage) {
       out.add(
           new WatchDecision(
@@ -539,7 +613,7 @@ public record FluxSystemSnapshot(
               "Decision: Check USB 3.0 camera 5V current draw and 3.3V/5V SmartIO sensors for shorts or regulator overload."));
     }
 
-    if (s.heapAllocRateMbPerSec() > 2.0) {
+    if (Double.isFinite(s.heapAllocRateMbPerSec()) && s.heapAllocRateMbPerSec() > 2.0) {
       out.add(
           new WatchDecision(
               "4. JVM Memory & GC",
@@ -552,58 +626,66 @@ public record FluxSystemSnapshot(
     }
 
     if (s.gcCorrelatedLoopSpikes() > 0) {
+      String gcDecision =
+          isRoboRio
+              ? "Decision: Keep -XX:+UseSerialGC on 32-bit roboRIO 2.0 (never enable 64-bit ZGC or -Xms512m) and eliminate per-loop object allocations in periodic()."
+              : "Decision: Update JVM launch flags in build.gradle to -XX:+UseZGC -XX:+AlwaysPreTouch -Xms512m -Xmx512m.";
       out.add(
           new WatchDecision(
               "4. JVM Memory & GC",
               "GC Pause <-> Loop Overrun Correlation",
               String.format(
                   Locale.US,
-                  "%d loop overruns aligned with GC (%d GCs, %.1f ms total)",
+                  "%d loop overruns aligned with GC (%s GCs, %s total)",
                   s.gcCorrelatedLoopSpikes(),
-                  s.gcCount(),
-                  s.gcTotalPauseMs()),
+                  formatCounter(s.gcCount(), ""),
+                  formatMetric(s.gcTotalPauseMs(), "%.1f", " ms")),
               "0 GC-induced loop overruns",
               s.gcCorrelatedLoopSpikes() >= 3 ? "CRITICAL" : "WARN",
               "JVM Garbage Collection pauses directly caused control loop overruns.",
-              "Decision: Update JVM launch flags in build.gradle to -XX:+UseZGC -XX:+AlwaysPreTouch -Xms512m -Xmx512m."));
+              gcDecision));
     }
 
-    if (hasSnapshotFile
-        && ((evaluateStorage && s.freeStorageMb() < 400.0)
-            || s.ioWaitPct() > 5.0
-            || s.logWriteLatencyMaxMs() > 25.0)) {
+    boolean lowFreeStorage =
+        evaluateStorage && Double.isFinite(s.freeStorageMb()) && s.freeStorageMb() < 400.0;
+    boolean highIoWait = Double.isFinite(s.ioWaitPct()) && s.ioWaitPct() > 5.0;
+    boolean highLogLatency =
+        Double.isFinite(s.logWriteLatencyMaxMs()) && s.logWriteLatencyMaxMs() > 25.0;
+    if (hasSnapshotFile && (lowFreeStorage || highIoWait || highLogLatency)) {
       out.add(
           new WatchDecision(
               "5. Storage & eMMC I/O",
               "eMMC Free Space & Log I/O Wait",
               String.format(
                   Locale.US,
-                  "Free=%.0f MB, iowait=%.1f%%, writeMax=%.1f ms",
-                  s.freeStorageMb(),
-                  s.ioWaitPct(),
-                  s.logWriteLatencyMaxMs()),
+                  "Free=%s, iowait=%s, writeMax=%s",
+                  formatMetric(s.freeStorageMb(), "%.0f", " MB"),
+                  formatMetric(s.ioWaitPct(), "%.1f", "%"),
+                  formatMetric(s.logWriteLatencyMaxMs(), "%.1f", " ms")),
               "Free >= 400 MB, iowait <= 5.0%",
-              (evaluateStorage && s.freeStorageMb() < 150.0) ? "CRITICAL" : "WARN",
-              "eMMC storage pressure or disk write latency spikes detected during match logging.",
-              "Decision: Switch camera recording from continuous 15 FPS (~48 MB/match) to the Hybrid Event-Driven preset (~4.5 MB/match) and clean old logs."));
+              (evaluateStorage && Double.isFinite(s.freeStorageMb()) && s.freeStorageMb() < 150.0)
+                  ? "CRITICAL"
+                  : "WARN",
+              "Storage pressure or disk write latency spikes detected during match logging.",
+              "Decision: Clean old robot logs on /home/lvuser/logs or /U/logs and verify SignalLogger.enableAutoLogging(false) is active."));
     }
 
-    if (hasSnapshotFile
-        && ((s.ipc() > 0.0 && s.ipc() < 0.80)
-            || s.l1dCacheMissPct() > 8.0
-            || s.llcMissPct() > 15.0
-            || s.involuntaryContextSwitches() > 500L)) {
+    boolean lowIpc = Double.isFinite(s.ipc()) && s.ipc() > 0.0 && s.ipc() < 0.80;
+    boolean highL1d = Double.isFinite(s.l1dCacheMissPct()) && s.l1dCacheMissPct() > 8.0;
+    boolean highLlc = Double.isFinite(s.llcMissPct()) && s.llcMissPct() > 15.0;
+    boolean highCtx = s.involuntaryContextSwitches() > 500L;
+    if (hasSnapshotFile && (lowIpc || highL1d || highLlc || highCtx)) {
       out.add(
           new WatchDecision(
               "6. ARMv8 Hardware PMU",
               "Cortex-A76 IPC, L3 Cache Misses & Context Switches",
               String.format(
                   Locale.US,
-                  "IPC=%.2f, L1D Miss=%.1f%%, LLC Miss=%.1f%%, InvolCtxSw=%d",
-                  s.ipc(),
-                  s.l1dCacheMissPct(),
-                  s.llcMissPct(),
-                  s.involuntaryContextSwitches()),
+                  "IPC=%s, L1D Miss=%s, LLC Miss=%s, InvolCtxSw=%s",
+                  formatMetric(s.ipc(), "%.2f", ""),
+                  formatMetric(s.l1dCacheMissPct(), "%.1f", "%"),
+                  formatMetric(s.llcMissPct(), "%.1f", "%"),
+                  formatCounter(s.involuntaryContextSwitches(), "")),
               "IPC >= 0.80, L1D <= 8.0%, LLC Miss <= 15.0%, InvolCtxSw <= 500",
               "WARN",
               "4x OV9281 camera pipelines are thrashing the shared 2 MB L3 cache or preempting real-time threads.",
@@ -613,33 +695,71 @@ public record FluxSystemSnapshot(
     return Collections.unmodifiableList(out);
   }
 
-  private static double parseDouble(String s, double def) {
-    if (s == null || s.isEmpty()) {
+  private static void appendStringLine(StringBuilder sb, String key, String value) {
+    if (value != null && !value.isBlank() && !"NOT MEASURED".equalsIgnoreCase(value.trim())) {
+      sb.append(key).append('=').append(value).append('\n');
+    }
+  }
+
+  private static void appendDoubleLine(
+      StringBuilder sb, String key, String formatPattern, double value) {
+    if (Double.isFinite(value)) {
+      sb.append(key).append('=').append(String.format(Locale.US, formatPattern, value)).append('\n');
+    }
+  }
+
+  private static void appendLongLine(StringBuilder sb, String key, long value) {
+    if (value >= 0L) {
+      sb.append(key).append('=').append(value).append('\n');
+    }
+  }
+
+  private static String nonBlankOrDefault(String s, String def) {
+    if (s == null || s.isBlank()) {
       return def;
     }
+    return s.trim();
+  }
+
+  private static double parseDoubleOrNaN(String s) {
+    if (s == null || s.isBlank()) {
+      return Double.NaN;
+    }
+    String clean = s.trim();
+    if ("NOT MEASURED".equalsIgnoreCase(clean) || "NaN".equalsIgnoreCase(clean)) {
+      return Double.NaN;
+    }
     try {
-      return Double.parseDouble(s.trim());
+      double parsed = Double.parseDouble(clean);
+      return Double.isFinite(parsed) ? parsed : Double.NaN;
     } catch (NumberFormatException e) {
-      return def;
+      return Double.NaN;
     }
   }
 
   private static long parseLong(String s, long def) {
-    if (s == null || s.isEmpty()) {
+    if (s == null || s.isBlank()) {
+      return def;
+    }
+    String clean = s.trim();
+    if ("NOT MEASURED".equalsIgnoreCase(clean)) {
       return def;
     }
     try {
-      return Long.parseLong(s.trim());
+      return Long.parseLong(clean);
     } catch (NumberFormatException e) {
       return def;
     }
   }
 
   private static int parseHexOrInt(String s, int def) {
-    if (s == null || s.isEmpty()) {
+    if (s == null || s.isBlank()) {
       return def;
     }
     String clean = s.trim().toLowerCase(Locale.ROOT);
+    if ("not measured".equals(clean)) {
+      return def;
+    }
     try {
       if (clean.startsWith("0x")) {
         return Integer.parseUnsignedInt(clean.substring(2), 16);

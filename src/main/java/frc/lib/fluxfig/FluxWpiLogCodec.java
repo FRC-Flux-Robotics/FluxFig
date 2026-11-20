@@ -259,7 +259,18 @@ public final class FluxWpiLogCodec {
       if (fileSize < 12) {
         throw new IOException("Invalid .wpilog file (too small): " + path);
       }
-      ByteBuffer buf = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize);
+      if (fileSize > Integer.MAX_VALUE - 8L) {
+        throw new IOException("Unsupported .wpilog file larger than 2 GiB: " + path);
+      }
+      // Read via FileChannel instead of channel.map so Windows releases the file handle on close.
+      ByteBuffer buf = ByteBuffer.allocate((int) fileSize);
+      while (buf.hasRemaining()) {
+        int bytesRead = channel.read(buf);
+        if (bytesRead < 0) {
+          break;
+        }
+      }
+      buf.flip();
       buf.order(ByteOrder.LITTLE_ENDIAN);
       return parseBuffer(path, buf);
     }
