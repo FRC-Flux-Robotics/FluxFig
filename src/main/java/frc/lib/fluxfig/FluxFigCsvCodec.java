@@ -580,13 +580,40 @@ final class FluxFigCsvCodec {
     return normProf + "\nmode=" + effMode.name() + "\nConfigSHA256=" + sha + "\n";
   }
 
+  static String formatActiveProfileDirective(
+      String profile, Mode mode, String configSha256, String channel, String preset) {
+    String normProf = normalizeProfileHeader(profile == null ? "DEFAULT" : profile);
+    Mode effMode = mode == null ? Mode.PRODUCTION : mode;
+    String sha = configSha256 == null ? "" : configSha256.trim();
+    String effChannel =
+        (channel == null || channel.isBlank())
+            ? (effMode == Mode.TUNING ? "EXPERIMENTAL" : "STABLE")
+            : channel.trim().toUpperCase(Locale.ROOT);
+    String effPreset =
+        (preset == null || preset.isBlank())
+            ? (effMode == Mode.TUNING ? "live-tuning" : "STABLE")
+            : preset.trim();
+    return normProf
+        + "\nmode="
+        + effMode.name()
+        + "\nConfigSHA256="
+        + sha
+        + "\nchannel="
+        + effChannel
+        + "\npreset="
+        + effPreset
+        + "\n";
+  }
+
   static ActiveProfileDirective parseActiveProfileDirective(String rawText) {
     if (rawText == null || rawText.isBlank()) {
-      return new ActiveProfileDirective("DEFAULT", Mode.PRODUCTION, "");
+      return new ActiveProfileDirective("DEFAULT", Mode.PRODUCTION, "", "STABLE", "STABLE");
     }
     String profile = "DEFAULT";
     Mode parsedMode = Mode.PRODUCTION;
     String sha = "";
+    String channel = null;
+    String preset = null;
     boolean profileSet = false;
     for (String rawLine : normalizeLineEndings(rawText).lines().toList()) {
       String line = rawLine.trim();
@@ -604,13 +631,192 @@ final class FluxFigCsvCodec {
           parsedMode = "TUNING".equalsIgnoreCase(v) ? Mode.TUNING : Mode.PRODUCTION;
         } else if ("ConfigSHA256".equalsIgnoreCase(k)) {
           sha = v;
+        } else if ("channel".equalsIgnoreCase(k)) {
+          channel = v.toUpperCase(Locale.ROOT);
+        } else if ("preset".equalsIgnoreCase(k)) {
+          preset = v;
         }
       } else if (!profileSet) {
         profile = normalizeProfileHeader(line);
         profileSet = true;
       }
     }
-    return new ActiveProfileDirective(profile, parsedMode, sha);
+    String effChannel =
+        (channel == null || channel.isBlank())
+            ? (parsedMode == Mode.TUNING ? "EXPERIMENTAL" : "STABLE")
+            : channel;
+    String effPreset =
+        (preset == null || preset.isBlank())
+            ? (parsedMode == Mode.TUNING ? "live-tuning" : "STABLE")
+            : preset;
+    return new ActiveProfileDirective(profile, parsedMode, sha, effChannel, effPreset);
+  }
+
+  /**
+   * Merges a behavioral delta preset CSV ({@code key,DEFAULT} or {@code key,value}) onto {@code
+   * baseParametersCsv}, updating {@code DEFAULT} and clearing any shadowing cell in {@code
+   * targetRobotProfile} while rejecting hardware-topology keys and preserving all other columns.
+   */
+  static String mergeBehavioralPresetParametersCsv(
+      String baseParametersCsv, String presetCsv, String targetRobotProfile) {
+    if (baseParametersCsv == null || baseParametersCsv.isBlank()) {
+      throw new IllegalArgumentException("Base parameters.csv must not be blank");
+    }
+    if (presetCsv == null || presetCsv.isBlank()) {
+      throw new IllegalArgumentException("Behavioral preset CSV must not be blank");
+    }
+    String normTargetRobot =
+        (targetRobotProfile == null || targetRobotProfile.isBlank())
+            ? ""
+            : normalizeProfileHeader(targetRobotProfile);
+
+    Map<String, String> presetValues = parseBehavioralPresetDeltas(presetCsv, normTargetRobot);
+    if (presetValues.isEmpty()) {
+      throw new IllegalArgumentException("Behavioral preset CSV contains zero parameter overrides");
+    }
+
+    String normalizedBase = normalizeLineEndings(baseParametersCsv);
+    List<String> leadingComments = extractLeadingCommentLines(normalizedBase);
+    List<String> rawHeaders = extractHeaderColumns(normalizedBase, List.of("key", "DEFAULT"));
+    String keyHeader = rawHeaders.isEmpty() ? "key" : rawHeaders.get(0);
+    List<String> profileHeaders = new ArrayList<>();
+    List<String> normProfiles = new ArrayList<>();
+    for (int i = 1; i < rawHeaders.size(); i++) {
+      profileHeaders.add(rawHeaders.get(i));
+      normProfiles.add(normalizeProfileHeader(rawHeaders.get(i)));
+    }
+    if (!normProfiles.contains("DEFAULT")) {
+      profileHeaders.add(0, "DEFAULT");
+      normProfiles.add(0, "DEFAULT");
+    }
+
+    Map<String, List<String>> paramHeaders = new LinkedHashMap<>();
+    Map<String, String> canonicalKeys = new LinkedHashMap<>();
+    Map<String, String> keySources = new LinkedHashMap<>();
+    Map<String, Map<String, String>> baseTable = new LinkedHashMap<>();
+    Map<String, List<Map<String, String>>> ignoredRelational = new LinkedHashMap<>();
+    List<String> parseErrors = new ArrayList<>();
+    parseAndClassifyCsv(
+        "parameters",
+        normalizedBase,
+        paramHeaders,
+        canonicalKeys,
+        keySources,
+        baseTable,
+        ignoredRelational,
+        parseErrors);
+    if (!parseErrors.isEmpty()) {
+      throw new IllegalArgumentException("Malformed base parameters.csv: " + parseErrors);
+    }
+
+    Map<String, Map<String, String>> mergedRows = new LinkedHashMap<>();
+    for (Map.Entry<String, Map<String, String>> entry : baseTable.entrySet()) {
+      mergedRows.put(entry.getKey(), new LinkedHashMap<>(entry.getValue()));
+    }
+
+    for (Map.Entry<String, String> delta : presetValues.entrySet()) {
+      String rawKey = delta.getKey();
+      String normKey = normalizeIdentifier(rawKey);
+      if (FluxFig.isHardwareTopologyParameterKey(rawKey)) {
+        throw new IllegalArgumentException(
+            "Behavioral preset cannot modify hardware topology parameter: " + rawKey);
+      }
+      String canonicalKey = canonicalKeys.getOrDefault(normKey, rawKey);
+      Map<String, String> cells =
+          mergedRows.computeIfAbsent(canonicalKey, k -> new LinkedHashMap<>());
+      cells.put("DEFAULT", delta.getValue());
+      if (!normTargetRobot.isEmpty() && !"DEFAULT".equalsIgnoreCase(normTargetRobot)) {
+        // Clear any shadowing cell on the connected robot so DEFAULT behavioral delta governs it.
+        cells.remove(normTargetRobot);
+      }
+    }
+
+    StringBuilder sb = new StringBuilder();
+    for (String cmt : leadingComments) {
+      sb.append(cmt).append('\n');
+    }
+    sb.append(formatCsvCell(keyHeader));
+    for (String ph : profileHeaders) {
+      sb.append(',').append(formatCsvCell(ph));
+    }
+    sb.append('\n');
+    for (Map.Entry<String, Map<String, String>> rowEntry : mergedRows.entrySet()) {
+      sb.append(formatCsvCell(rowEntry.getKey()));
+      Map<String, String> cells = rowEntry.getValue();
+      for (String np : normProfiles) {
+        sb.append(',').append(formatCsvCell(cells.getOrDefault(np, "")));
+      }
+      sb.append('\n');
+    }
+    return normalizeLineEndings(sb.toString());
+  }
+
+  private static Map<String, String> parseBehavioralPresetDeltas(
+      String presetCsv, String normTargetRobot) {
+    List<String> lines = normalizeLineEndings(presetCsv).lines().toList();
+    String[] headers = null;
+    int headerIdx = -1;
+    for (int i = 0; i < lines.size(); i++) {
+      String trimmed = lines.get(i).trim();
+      if (!trimmed.isEmpty() && !trimmed.startsWith("#")) {
+        headers = parseCsvLine(trimmed);
+        headerIdx = i;
+        break;
+      }
+    }
+    if (headers == null || headers.length < 2) {
+      throw new IllegalArgumentException(
+          "Behavioral preset CSV must have header 'key,DEFAULT' or 'key,value'");
+    }
+    String firstCol = normalizeProfileHeader(headers[0]);
+    if (!"key".equalsIgnoreCase(firstCol)) {
+      throw new IllegalArgumentException(
+          "Behavioral preset CSV first column must be 'key' (got '" + headers[0] + "')");
+    }
+
+    int defaultColIdx = -1;
+    int targetRobotColIdx = -1;
+    for (int c = 1; c < headers.length; c++) {
+      String col = normalizeProfileHeader(headers[c]);
+      if ("DEFAULT".equalsIgnoreCase(col) || "value".equalsIgnoreCase(col)) {
+        if (defaultColIdx < 0) {
+          defaultColIdx = c;
+        }
+      }
+      if (!normTargetRobot.isEmpty() && col.equalsIgnoreCase(normTargetRobot)) {
+        targetRobotColIdx = c;
+      }
+    }
+    if (defaultColIdx < 0) {
+      defaultColIdx = 1;
+    }
+
+    Map<String, String> deltas = new LinkedHashMap<>();
+    for (int r = headerIdx + 1; r < lines.size(); r++) {
+      String line = lines.get(r).trim();
+      if (line.isEmpty() || line.startsWith("#")) {
+        continue;
+      }
+      String[] cols = parseCsvLine(line);
+      if (cols.length == 0 || cols[0].isBlank()) {
+        continue;
+      }
+      String key = cols[0].trim();
+      if (FluxFig.isHardwareTopologyParameterKey(key)) {
+        throw new IllegalArgumentException(
+            "Behavioral preset cannot modify hardware topology parameter: " + key);
+      }
+      String val = "";
+      if (targetRobotColIdx >= 0 && targetRobotColIdx < cols.length && !cols[targetRobotColIdx].isBlank()) {
+        val = cols[targetRobotColIdx].trim();
+      } else if (defaultColIdx < cols.length && !cols[defaultColIdx].isBlank()) {
+        val = cols[defaultColIdx].trim();
+      }
+      if (!val.isEmpty()) {
+        deltas.put(key, val);
+      }
+    }
+    return deltas;
   }
 
   static void parseAndClassifyCsv(

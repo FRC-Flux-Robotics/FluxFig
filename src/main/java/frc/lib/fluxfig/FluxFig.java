@@ -54,12 +54,19 @@ public final class FluxFig {
   public static final String ACTIVE_PROFILE_FILE = "active-profile.txt";
 
   /**
+   * Canonical POSIX path on roboRIO / SystemCore ({@code /tmp/fluxfig-tuned-snapshot.txt}) so
+   * Windows callers never rewrite forward slashes to backslashes over SSH.
+   */
+  public static final String DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH =
+      "/tmp/fluxfig-tuned-snapshot.txt";
+
+  /**
    * Default RAM-disk snapshot path on the robot ({@code /tmp/fluxfig-tuned-snapshot.txt}) where
    * {@link Mode#TUNING} writes temporary live-tuned diffs on Disable so {@code FluxTray} can
    * harvest them over SFTP without mutating {@code deploy/configs/*.csv} on the robot.
    */
   public static final Path DEFAULT_TMP_TUNED_SNAPSHOT_PATH =
-      Path.of("/tmp/fluxfig-tuned-snapshot.txt");
+      Path.of(DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH);
 
   /** Topic prefix used when publishing {@link Tunable} parameters and table cells in TUNING mode. */
   public static final String TUNING_TOPIC_PREFIX = "/FluxFig/Tuning/";
@@ -67,6 +74,25 @@ public final class FluxFig {
   /** Default core tabs fetched from Google Sheets when no explicit tab list or local CSVs exist. */
   public static final List<String> DEFAULT_SHEET_TABS =
       List.of("parameters", "mechanisms", "cameras", "batteries");
+
+  private static final Set<String> HARDWARE_TOPOLOGY_PARAMETER_KEYS =
+      Set.of(
+          "controllerprofile",
+          "swervecanbus",
+          "drivecanbus",
+          "mechcanbus",
+          "auxcanbus",
+          "visionbackend",
+          "coordinatesystem",
+          "simulatemissingmechanisms",
+          "pigeonid",
+          "trackwidthmeters",
+          "wheelbasemeters",
+          "wheelradiusmeters",
+          "drivegearratio",
+          "turngearratio",
+          "loopperiodms",
+          "odometryfrequencyhz");
 
   private static final Set<String> STRUCTURAL_PARAMETER_KEYS =
       Set.of(
@@ -80,7 +106,42 @@ public final class FluxFig {
           "simulatemissingmechanisms",
           "drivestatorlimitamps",
           "drivesupplylimitamps",
-          "driveslipcurrentamps");
+          "driveslipcurrentamps",
+          "pigeonid",
+          "trackwidthmeters",
+          "wheelbasemeters",
+          "wheelradiusmeters",
+          "drivegearratio",
+          "turngearratio",
+          "odometryfrequencyhz");
+
+  private static final Set<String> STRUCTURAL_MECHANISM_COLUMNS =
+      Set.of(
+          "robot",
+          "mechanism",
+          "motorid",
+          "canbus",
+          "statorlimitamps",
+          "supplylimitamps",
+          "slipcurrentamps",
+          "gravitytype",
+          "followermotorid",
+          "invertfollower",
+          "motorinverted",
+          "gearratio");
+
+  /** Returns true if {@code key} is a structural parameter locked out of live NT4 tuning. */
+  public static boolean isStructuralParameterKey(String key) {
+    return STRUCTURAL_PARAMETER_KEYS.contains(FluxFigCsvCodec.normalizeIdentifier(key));
+  }
+
+  /**
+   * Returns true if {@code key} defines per-robot hardware topology (CAN buses, Pigeon ID, frame
+   * geometry, gear ratios) that behavioral preset CSVs are forbidden to modify.
+   */
+  public static boolean isHardwareTopologyParameterKey(String key) {
+    return HARDWARE_TOPOLOGY_PARAMETER_KEYS.contains(FluxFigCsvCodec.normalizeIdentifier(key));
+  }
 
   /**
    * Operating mode for {@link FluxFig}:
@@ -176,7 +237,17 @@ public final class FluxFig {
   }
 
   /** Parsed contents of {@code deploy/configs/active-profile.txt} written by {@code FluxTray}. */
-  public record ActiveProfileDirective(String profile, Mode mode, String expectedConfigSha256) {}
+  public record ActiveProfileDirective(
+      String profile, Mode mode, String expectedConfigSha256, String channel, String preset) {
+    public ActiveProfileDirective(String profile, Mode mode, String expectedConfigSha256) {
+      this(
+          profile,
+          mode,
+          expectedConfigSha256,
+          mode == Mode.TUNING ? "EXPERIMENTAL" : "STABLE",
+          mode == Mode.TUNING ? "live-tuning" : "STABLE");
+    }
+  }
 
   public record MechanismSpec(
       String robot,
@@ -356,6 +427,8 @@ public final class FluxFig {
       String columnOrKey,
       String publishedBaseline) {}
 
+  private record RegisteredTunableCell(String tableName, String rowKey, String column) {}
+
   private final Path configDir;
   private final Map<String, String> rawCsvFiles = new LinkedHashMap<>();
   private final Map<String, List<String>> parameterHeaders = new LinkedHashMap<>();
@@ -367,6 +440,7 @@ public final class FluxFig {
   private final Map<TableCellOverrideKey, String> tableCellOverrides = new LinkedHashMap<>();
   private final Map<String, BoundTuningTopic> boundTuningTopics = new LinkedHashMap<>();
   private final Set<String> registeredTunableParamKeys = new LinkedHashSet<>();
+  private final Set<RegisteredTunableCell> registeredTunableTableCells = new LinkedHashSet<>();
   private final Map<String, Class<? extends Record>> registeredTableSchemas =
       new LinkedHashMap<>();
   private final Map<String, MechanismSpec> mechanismSpecs = new LinkedHashMap<>();
@@ -566,12 +640,34 @@ public final class FluxFig {
   }
 
   /**
+   * Formats {@code deploy/configs/active-profile.txt} including explicit {@code channel} ({@code
+   * STABLE} vs. {@code EXPERIMENTAL}) and {@code preset} metadata for {@code run-meta.json}
+   * stamping and {@code FluxTray} config switching.
+   */
+  public static String formatActiveProfileDirective(
+      String profile, Mode mode, String configSha256, String channel, String preset) {
+    return FluxFigCsvCodec.formatActiveProfileDirective(
+        profile, mode, configSha256, channel, preset);
+  }
+
+  /**
    * Parses {@code deploy/configs/active-profile.txt} written by {@code FluxTray} (supporting both
-   * the legacy 2-line {@code <profile>\nConfigSHA256=...} format and the {@code mode=TUNING|PRODUCTION}
-   * directive).
+   * the legacy 2-line {@code <profile>\nConfigSHA256=...} format and the {@code mode}, {@code
+   * channel}, and {@code preset} directives).
    */
   public static ActiveProfileDirective parseActiveProfileDirective(String rawText) {
     return FluxFigCsvCodec.parseActiveProfileDirective(rawText);
+  }
+
+  /**
+   * Merges a behavioral delta preset CSV (such as {@code 01_crawl_1p5mps.csv}) onto a robot's
+   * clean {@code parameters.csv} without touching hardware topology keys ({@code swerveCanBus},
+   * {@code pigeonId}, chassis geometry, gear ratios) or relational hardware tables.
+   */
+  public static String mergeBehavioralPresetParametersCsv(
+      String baseParametersCsv, String presetCsv, String targetRobotProfile) {
+    return FluxFigCsvCodec.mergeBehavioralPresetParametersCsv(
+        baseParametersCsv, presetCsv, targetRobotProfile);
   }
 
   /**
@@ -941,22 +1037,58 @@ public final class FluxFig {
 
   /**
    * Explicitly registers specific {@code parameters.csv} keys (or all non-structural numeric keys
-   * if {@code keys} is empty) to be published to the dashboard in {@link Mode#TUNING}.
+   * if {@code keys} is empty) to be published to the dashboard in {@link Mode#TUNING}. Rejects
+   * structural hardware/safety keys (CAN buses, Pigeon ID, frame dimensions, 60 A / 40 A caps).
    */
   public synchronized void registerTunableParameters(String... keys) {
     if (keys == null || keys.length == 0) {
       for (String k : parameterTable.keySet()) {
-        if (!STRUCTURAL_PARAMETER_KEYS.contains(FluxFigCsvCodec.normalizeIdentifier(k))) {
+        if (!isStructuralParameterKey(k)) {
           registeredTunableParamKeys.add(k);
         }
       }
     } else {
       for (String k : keys) {
         if (k != null && !k.isBlank()) {
+          if (isStructuralParameterKey(k)) {
+            throw new IllegalArgumentException(
+                "Refusing to expose structural/safety parameter for live tuning: " + k);
+          }
           registeredTunableParamKeys.add(resolveCanonicalParameterKey(k));
         }
       }
     }
+    if (mode == Mode.TUNING && tuningBackend != null) {
+      publishRegisteredTunableParameters();
+    }
+  }
+
+  /**
+   * Registers a single relational table cell (e.g. {@code ("mechanisms", "SwerveDriveFL", "kP")})
+   * for live dashboard tuning without publishing unrelated rows. Rejects structural mechanism
+   * columns (motor IDs, CAN bus, current caps, inversions, gear ratios).
+   */
+  public synchronized void registerTunableTableCell(
+      String tableName, String rowKey, String column) {
+    if (tableName == null
+        || tableName.isBlank()
+        || rowKey == null
+        || rowKey.isBlank()
+        || column == null
+        || column.isBlank()) {
+      throw new IllegalArgumentException("tableName, rowKey, and column must be non-blank");
+    }
+    String cleanTable = FluxFigCsvCodec.stripCsvExtension(tableName).toLowerCase(Locale.ROOT);
+    String normCol = FluxFigCsvCodec.normalizeIdentifier(column);
+    if ("mechanisms".equals(cleanTable) && STRUCTURAL_MECHANISM_COLUMNS.contains(normCol)) {
+      throw new IllegalArgumentException(
+          "Refusing to expose structural mechanism column for live tuning: "
+              + cleanTable
+              + "."
+              + column);
+    }
+    registeredTunableTableCells.add(
+        new RegisteredTunableCell(cleanTable, rowKey.trim(), column.trim()));
     if (mode == Mode.TUNING && tuningBackend != null) {
       publishRegisteredTunableParameters();
     }
@@ -971,6 +1103,9 @@ public final class FluxFig {
             ? defaultTunableParameterKeys()
             : registeredTunableParamKeys;
     for (String rawKey : keysToPublish) {
+      if (isStructuralParameterKey(rawKey)) {
+        continue;
+      }
       String canonicalKey = resolveCanonicalParameterKey(rawKey);
       Optional<String> valOpt = resolveEffectiveParameter(activeProfile, canonicalKey);
       if (valOpt.isPresent()) {
@@ -983,6 +1118,52 @@ public final class FluxFig {
                 topic, false, "parameters", activeProfile, "", canonicalKey, val));
       }
     }
+    for (RegisteredTunableCell cell : registeredTunableTableCells) {
+      Optional<String> cellOpt = resolveTableCellEffective(cell.tableName(), activeProfile, cell.rowKey(), cell.column());
+      if (cellOpt.isPresent()) {
+        String topic =
+            TUNING_TOPIC_PREFIX + cell.tableName() + "/" + cell.rowKey() + "/" + cell.column();
+        String val = cellOpt.get();
+        tuningBackend.publish(topic, val);
+        boundTuningTopics.put(
+            topic,
+            new BoundTuningTopic(
+                topic,
+                true,
+                cell.tableName(),
+                activeProfile,
+                cell.rowKey(),
+                cell.column(),
+                val));
+      }
+    }
+  }
+
+  private Optional<String> resolveTableCellEffective(
+      String tableName, String profile, String rowKey, String column) {
+    List<Map<String, String>> rows = getTableForProfile(tableName, profile);
+    if (rows.isEmpty()) {
+      return Optional.empty();
+    }
+    String keyCol =
+        "mechanisms".equalsIgnoreCase(tableName)
+            ? "mechanism"
+            : ("cameras".equalsIgnoreCase(tableName)
+                ? "cameraName"
+                : ("batteries".equalsIgnoreCase(tableName) ? "batteryName" : null));
+    for (Map<String, String> row : rows) {
+      String candidateKey =
+          keyCol != null
+              ? FluxFigCsvCodec.findCellByColumnNameOrDefault(row, keyCol, "")
+              : FluxFigCsvCodec.findCellByColumnNameOrDefault(row, "preset", "");
+      if (candidateKey.equalsIgnoreCase(rowKey)) {
+        String val = FluxFigCsvCodec.findCellByColumnName(row, column);
+        if (val != null && !val.isBlank()) {
+          return Optional.of(val.trim());
+        }
+      }
+    }
+    return Optional.empty();
   }
 
   private Set<String> defaultTunableParameterKeys() {

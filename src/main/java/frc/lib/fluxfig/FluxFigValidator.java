@@ -35,6 +35,7 @@ final class FluxFigValidator {
       Set.of(
           "loopperiodms",
           "loopperiodsec",
+          "odometryfrequencyhz",
           "drivegearratio",
           "turngearratio",
           "wheelradiusmeters",
@@ -43,6 +44,8 @@ final class FluxFigValidator {
           "swervecouplingratio",
           "maxlinearspeedmps",
           "maxangularspeedradpersec",
+          "joysticksensitivity",
+          "rotationsensitivity",
           "brownoutshedthresholdvolts",
           "shoplengthmeters",
           "shopwidthmeters");
@@ -1120,6 +1123,27 @@ final class FluxFigValidator {
                   + "."
                   + key
                   + "] physical constant must be finite and > 0.0 (got "
+                  + val
+                  + ")");
+        } else if (("joysticksensitivity".equals(keyNorm) || "rotationsensitivity".equals(keyNorm))
+            && d > 1.0) {
+          errors.add(
+              sourceLabel
+                  + " ["
+                  + prof
+                  + "."
+                  + key
+                  + "] sensitivity scale must be in (0.0, 1.0] (got "
+                  + val
+                  + ")");
+        } else if ("odometryfrequencyhz".equals(keyNorm) && (d < 20.0 || d > 250.0)) {
+          errors.add(
+              sourceLabel
+                  + " ["
+                  + prof
+                  + "."
+                  + key
+                  + "] odometryFrequencyHz must be in [20.0, 250.0] (got "
                   + val
                   + ")");
         }

@@ -121,6 +121,7 @@ public final class FluxFigTest {
       testWpiLogLongUptimeAndShortBufferGuards();
       testRoboRio2SnapshotCaptureParsingAndEvaluation();
       testHardwareSafetyValidatorBypassesClosed();
+      testMultiConfigPresetsActiveProfileChannelAndTargetedCellTuning();
       System.out.println("FluxFigTest: ALL TESTS PASSED");
     } finally {
       cleanupTempPaths();
@@ -1492,5 +1493,125 @@ public final class FluxFigTest {
     check(
         physErrors.stream().anyMatch(e -> e.contains("Unresolved CAN bus reference '$typoCanBus'")),
         "validateStrict() must reject unresolved $typoCanBus reference: " + physErrors);
+  }
+
+  private static void testMultiConfigPresetsActiveProfileChannelAndTargetedCellTuning()
+      throws Exception {
+    check(
+        "/tmp/fluxfig-tuned-snapshot.txt".equals(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH),
+        "Canonical POSIX tuned snapshot remote path must use forward slashes");
+
+    String formatted =
+        FluxFig.formatActiveProfileDirective(
+            "CHASSIS_3", Mode.TUNING, "aa7a7262", "EXPERIMENTAL", "01_crawl_1p5mps");
+    ActiveProfileDirective parsed = FluxFig.parseActiveProfileDirective(formatted);
+    check("CHASSIS_3".equals(parsed.profile()), "Parsed profile CHASSIS_3");
+    check(parsed.mode() == Mode.TUNING, "Parsed mode TUNING");
+    check("aa7a7262".equals(parsed.expectedConfigSha256()), "Parsed ConfigSHA256");
+    check("EXPERIMENTAL".equals(parsed.channel()), "Parsed channel EXPERIMENTAL");
+    check("01_crawl_1p5mps".equals(parsed.preset()), "Parsed preset name");
+
+    ActiveProfileDirective legacyDir =
+        FluxFig.parseActiveProfileDirective("FUEL\nmode=PRODUCTION\nConfigSHA256=12345678\n");
+    check("STABLE".equals(legacyDir.channel()), "Legacy PRODUCTION defaults channel to STABLE");
+    check("STABLE".equals(legacyDir.preset()), "Legacy PRODUCTION defaults preset to STABLE");
+
+    String baseParams =
+        """
+        # Base fleet parameters
+        key,DEFAULT,FUEL,CHASSIS_3
+        controllerProfile,ROBORIO_CANIVORE_2026,ROBORIO_CANIVORE_2026,ROBORIO_CANIVORE_2026
+        swerveCanBus,Drivetrain,Drivetrain,rio
+        pigeonId,20,20,24
+        maxLinearSpeedMps,4.5,,4.2
+        maxAngularSpeedRadPerSec,4.71,,
+        driveStatorLimitAmps,60.0,,
+        driveSupplyLimitAmps,40.0,,
+        driveSlipCurrentAmps,60.0,,
+        """;
+    String crawlPreset =
+        """
+        # Crawl preset for first carpet run
+        key,DEFAULT
+        maxLinearSpeedMps,1.5
+        maxAngularSpeedRadPerSec,2.5
+        joystickSensitivity,0.65
+        """;
+    String mergedParams =
+        FluxFig.mergeBehavioralPresetParametersCsv(baseParams, crawlPreset, "CHASSIS_3");
+    String baseMechs =
+        """
+        robot,mechanism,motorId,canBus,statorLimitAmps,supplyLimitAmps,slipCurrentAmps,gravityType,kP,kI,kD,kS,kV,kA,kG,minPosRot,maxPosRot,followerMotorId,invertFollower,motorInverted,gearRatio
+        CHASSIS_3,SwerveDriveFL,1,rio,60.0,40.0,60.0,NONE,0.90,0.0,0.0,0.14,0.79,0.10,0.0,-10000.0,10000.0,-1,false,false,6.3947
+        """;
+    FluxFig mergedFig =
+        FluxFig.fromCsvMap(
+            Map.of("parameters.csv", mergedParams, "mechanisms.csv", baseMechs), "CHASSIS_3");
+    check(
+        mergedFig.validateStrict().isEmpty(),
+        "Merged behavioral preset must pass validateStrict(): " + mergedFig.validateStrict());
+    check(
+        Math.abs(mergedFig.getDouble("maxLinearSpeedMps") - 1.5) < 1e-6,
+        "Merged preset must override CHASSIS_3 shadowing maxLinearSpeedMps to 1.5");
+    check(
+        Math.abs(mergedFig.getDouble("maxAngularSpeedRadPerSec") - 2.5) < 1e-6,
+        "Merged preset must update maxAngularSpeedRadPerSec to 2.5");
+    check(
+        Math.abs(mergedFig.getDouble("joystickSensitivity") - 0.65) < 1e-6,
+        "Merged preset must append new behavioral key joystickSensitivity");
+    check(
+        "rio".equals(mergedFig.getString("swerveCanBus")) && mergedFig.getInt("pigeonId") == 24,
+        "Merged preset must preserve CHASSIS_3 hardware topology (swerveCanBus=rio, pigeonId=24)");
+    check(
+        mergedParams.contains("# Base fleet parameters"),
+        "Merged parameters.csv must preserve leading comments");
+
+    boolean rejectedHardwareKey = false;
+    try {
+      FluxFig.mergeBehavioralPresetParametersCsv(
+          baseParams, "key,DEFAULT\nswerveCanBus,CANdace\n", "CHASSIS_3");
+    } catch (IllegalArgumentException expected) {
+      rejectedHardwareKey = true;
+    }
+    check(rejectedHardwareKey, "Behavioral preset must reject hardware topology key swerveCanBus");
+
+    // Targeted single-cell tuning on mechanisms.csv SwerveDriveFL.kP and structural guards.
+    InMemoryTuningBackend backend = new InMemoryTuningBackend();
+    Path tmpSnap = createTempFile("fluxfig-targeted-snap-", ".txt");
+    mergedFig.setTmpTunedSnapshotPath(tmpSnap);
+    mergedFig.registerTunableParameters("maxLinearSpeedMps", "joystickSensitivity");
+    mergedFig.registerTunableTableCell("mechanisms", "SwerveDriveFL", "kP");
+    mergedFig.enableTuning(backend);
+    check(
+        "0.90".equals(backend.getPublishedTopics().get("/FluxFig/Tuning/mechanisms/SwerveDriveFL/kP")),
+        "Targeted table cell must publish SwerveDriveFL.kP");
+    backend.putFromDashboard("mechanisms/SwerveDriveFL/kP", "1.15");
+    backend.putFromDashboard("parameters/maxLinearSpeedMps", "2.0");
+    check(mergedFig.pollTuning() == 2, "Expected 2 polled targeted tuning edits");
+    check(
+        Math.abs(mergedFig.getMechanismSpec("CHASSIS_3", "SwerveDriveFL").kP() - 1.15) < 1e-6,
+        "Targeted cell edit must immediately update hydrated MechanismSpec kP");
+    String snap = Files.readString(tmpSnap, StandardCharsets.UTF_8);
+    check(
+        snap.contains("mechanisms[CHASSIS_3:SwerveDriveFL].kP: 0.90 -> 1.15")
+            && snap.contains("CHASSIS_3.maxLinearSpeedMps: 1.5 -> 2.0"),
+        "Written tuned snapshot must capture both parameter and targeted table cell overrides: "
+            + snap);
+
+    boolean rejectedStructuralParam = false;
+    try {
+      mergedFig.registerTunableParameters("driveStatorLimitAmps");
+    } catch (IllegalArgumentException expected) {
+      rejectedStructuralParam = true;
+    }
+    check(rejectedStructuralParam, "registerTunableParameters must reject driveStatorLimitAmps");
+
+    boolean rejectedStructuralCell = false;
+    try {
+      mergedFig.registerTunableTableCell("mechanisms", "SwerveDriveFL", "statorLimitAmps");
+    } catch (IllegalArgumentException expected) {
+      rejectedStructuralCell = true;
+    }
+    check(rejectedStructuralCell, "registerTunableTableCell must reject statorLimitAmps");
   }
 }
