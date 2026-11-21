@@ -9,8 +9,8 @@ import java.util.Map;
 
 /**
  * Shared zero-dependency offline system telemetry snapshot ({@code system-snapshot.txt}) and
- * 14-metric SystemCore / roboRIO watch evaluator used by {@code FluxTray}, {@code FluxProcessor},
- * and the FLUX 10413 robot repositories.
+ * SystemCore / roboRIO watch evaluator used by {@code FluxTray}, {@code FluxProcessor}, and the
+ * FLUX 10413 robot repositories.
  */
 public record FluxSystemSnapshot(
     String controllerType,
@@ -47,7 +47,92 @@ public record FluxSystemSnapshot(
     double l1dCacheMissPct,
     double llcMissPct,
     long involuntaryContextSwitches,
-    List<CanInterfaceStats> canInterfaces) {
+    List<CanInterfaceStats> canInterfaces,
+    double phoenixSignalsTraceMaxMs,
+    double commandSchedulerTraceMaxMs,
+    double robotContainerTraceMaxMs,
+    double internalFreeStorageMb,
+    double usbFreeStorageMb) {
+
+  /** Backward-compatible 35-argument constructor for existing SystemCore/roboRIO callers. */
+  public FluxSystemSnapshot(
+      String controllerType,
+      String hostname,
+      String kernelVersion,
+      double uptimeSec,
+      double loopPeriodMs,
+      double loopMedianMs,
+      double loopP99Ms,
+      double loopMaxMs,
+      double firstEnablePeakMs,
+      double odometryJitterMaxMs,
+      double driveTraceMaxMs,
+      double visionTraceMaxMs,
+      double superstructureTraceMaxMs,
+      double totalCpuPct,
+      double javaProcessCpuPct,
+      double visionDaemonCpuPct,
+      double softIrqPct,
+      double hardIrqPct,
+      double ioWaitPct,
+      long spiCanIrqCount,
+      long usbXhciIrqCount,
+      double cpuTempC,
+      double cpuFreqMHz,
+      int throttledFlags,
+      double heapAllocRateMbPerSec,
+      int gcCount,
+      double gcTotalPauseMs,
+      int gcCorrelatedLoopSpikes,
+      double freeStorageMb,
+      double logWriteLatencyMaxMs,
+      double ipc,
+      double l1dCacheMissPct,
+      double llcMissPct,
+      long involuntaryContextSwitches,
+      List<CanInterfaceStats> canInterfaces) {
+    this(
+        controllerType,
+        hostname,
+        kernelVersion,
+        uptimeSec,
+        loopPeriodMs,
+        loopMedianMs,
+        loopP99Ms,
+        loopMaxMs,
+        firstEnablePeakMs,
+        odometryJitterMaxMs,
+        driveTraceMaxMs,
+        visionTraceMaxMs,
+        superstructureTraceMaxMs,
+        totalCpuPct,
+        javaProcessCpuPct,
+        visionDaemonCpuPct,
+        softIrqPct,
+        hardIrqPct,
+        ioWaitPct,
+        spiCanIrqCount,
+        usbXhciIrqCount,
+        cpuTempC,
+        cpuFreqMHz,
+        throttledFlags,
+        heapAllocRateMbPerSec,
+        gcCount,
+        gcTotalPauseMs,
+        gcCorrelatedLoopSpikes,
+        freeStorageMb,
+        logWriteLatencyMaxMs,
+        ipc,
+        l1dCacheMissPct,
+        llcMissPct,
+        involuntaryContextSwitches,
+        canInterfaces,
+        Double.NaN,
+        Double.NaN,
+        Double.NaN,
+        Double.NaN,
+        Double.NaN);
+  }
 
   /** Per-interface Linux SocketCAN or roboRIO CAN bus counters. */
   public record CanInterfaceStats(
@@ -73,8 +158,8 @@ public record FluxSystemSnapshot(
 
   /**
    * Single non-intrusive BusyBox-safe shell command executed over SSH after a run to capture Linux
-   * {@code /proc} and {@code /sys} counters on SystemCore or roboRIO without touching robot Java
-   * code.
+   * {@code /proc} and {@code /sys} counters on SystemCore or roboRIO 2.0 without touching robot
+   * Java code.
    */
   public static final String REMOTE_CAPTURE_SH_COMMAND =
       "echo '[PLATFORM]'; "
@@ -85,14 +170,26 @@ public record FluxSystemSnapshot(
           + "echo \"kernelVersion=$(uname -r 2>/dev/null || echo 'NOT MEASURED')\"; "
           + "awk '{print \"uptimeSec=\"$1}' /proc/uptime 2>/dev/null || true; "
           + "echo '[CPU_AND_IRQ]'; "
-          + "awk '/^cpu / {total=$2+$3+$4+$5+$6+$7+$8; if (total>0) {printf \"totalCpuPct=%.1f\\nioWaitPct=%.1f\\nhardIrqPct=%.1f\\nsoftIrqPct=%.1f\\n\", (total-$5)*100.0/total, $6*100.0/total, $7*100.0/total, $8*100.0/total}}' /proc/stat 2>/dev/null || true; "
-          + "if ps -eo pcpu,comm >/dev/null 2>&1; then ps -eo pcpu,comm 2>/dev/null | awk '$1 ~ /^[0-9]+(\\.[0-9]+)?$/ {if ($2 ~ /java/) j+=$1; if ($2 ~ /limelight|photon/) v+=$1} END {if (j>0) printf \"javaProcessCpuPct=%.1f\\n\", j; if (v>0) printf \"visionDaemonCpuPct=%.1f\\n\", v}'; fi; "
+          + "s1=$(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8; exit}' /proc/stat 2>/dev/null || true); "
+          + "if [ -n \"$s1\" ]; then "
+          + "  sleep 0.2 2>/dev/null || sleep 1; "
+          + "  s2=$(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8; exit}' /proc/stat 2>/dev/null || true); "
+          + "  printf '%s\\n%s\\n' \"$s1\" \"$s2\" | awk 'NR==1{u1=$1;n1=$2;s1=$3;i1=$4;w1=$5;h1=$6;q1=$7} "
+          + "NR==2{du=$1-u1;dn=$2-n1;ds=$3-s1;di=$4-i1;dw=$5-w1;dh=$6-h1;dq=$7-q1; dt=du+dn+ds+di+dw+dh+dq; "
+          + "if(dt>0){printf \"totalCpuPct=%.1f\\nioWaitPct=%.1f\\nhardIrqPct=%.1f\\nsoftIrqPct=%.1f\\n\", (dt-di)*100.0/dt, dw*100.0/dt, dh*100.0/dt, dq*100.0/dt} "
+          + "else{t2=$1+$2+$3+$4+$5+$6+$7; if(t2>0){printf \"totalCpuPct=%.1f\\nioWaitPct=%.1f\\nhardIrqPct=%.1f\\nsoftIrqPct=%.1f\\n\", (t2-$4)*100.0/t2, $5*100.0/t2, $6*100.0/t2, $7*100.0/t2}}}'; "
+          + "fi; "
+          + "if ps -eo pcpu,comm >/dev/null 2>&1; then "
+          + "  ps -eo pcpu,comm 2>/dev/null | awk '$1 ~ /^[0-9]+(\\.[0-9]+)?$/ {if ($2 ~ /java/) j+=$1; if ($2 ~ /limelight|photon/) v+=$1} END {if (j>0) printf \"javaProcessCpuPct=%.1f\\n\", j; if (v>0) printf \"visionDaemonCpuPct=%.1f\\n\", v}'; "
+          + "elif top -b -n 1 >/dev/null 2>&1; then "
+          + "  top -b -n 1 2>/dev/null | awk 'BEGIN{c=0} /PID/ && /CPU/ {for(i=1;i<=NF;i++){if($i==\"%CPU\"){c=i;break} else if($i ~ /CPU/) c=i} next} c>0 && NF>=c {v=$c; gsub(/%/,\"\",v); if(v ~ /^[0-9]+(\\.[0-9]+)?$/){if($0 ~ /java/) j+=v; if($0 ~ /limelight|photon/) vis+=v}} END {if(j>0) printf \"javaProcessCpuPct=%.1f\\n\", j; if(vis>0) printf \"visionDaemonCpuPct=%.1f\\n\", vis}'; "
+          + "fi; "
           + "echo '[THERMAL_AND_POWER]'; "
           + "if [ -f /sys/class/thermal/thermal_zone0/temp ]; then awk '{printf \"cpuTempC=%.1f\\n\", $1/1000.0}' /sys/class/thermal/thermal_zone0/temp; fi; "
           + "if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then awk '{printf \"cpuFreqMHz=%.0f\\n\", $1/1000.0}' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq; fi; "
           + "if command -v vcgencmd >/dev/null 2>&1; then vcgencmd get_throttled 2>/dev/null | sed 's/throttled=/throttledHex=/' || true; fi; "
           + "echo '[SOCKETCAN]'; "
-          + "for d in /sys/class/net/can_*; do "
+          + "for d in /sys/class/net/can*; do "
           + "  [ -e \"$d\" ] || continue; "
           + "  b=$(basename \"$d\"); "
           + "  rxp=$(cat \"$d/statistics/rx_packets\" 2>/dev/null || echo 0); "
@@ -103,16 +200,33 @@ public record FluxSystemSnapshot(
           + "  ipout=$(ip -d -s link show \"$b\" 2>/dev/null || true); "
           + "  st=$(printf '%s\\n' \"$ipout\" | awk '/can state/ {for(i=1;i<=NF;i++) if($i==\"state\") {print $(i+1); exit}}'); "
           + "  berr=$(printf '%s\\n' \"$ipout\" | awk '/berr-counter/ {tx=0; rx=0; for(i=1;i<=NF;i++) {if($i==\"tx\") tx=$(i+1)+0; if($i==\"rx\") rx=$(i+1)+0} print tx+rx; exit}'); "
-          + "  rst=$(printf '%s\\n' \"$ipout\" | awk '/restarts/ {getline; print $6+0; exit}'); "
+          + "  if [ -z \"$berr\" ]; then berr=$(printf '%s\\n' \"$ipout\" | awk '/bus-errors/ {col=0; for(i=1;i<=NF;i++) if($i==\"bus-errors\") {col=i; break} if(col>0 && getline>0) print $(col)+0; exit}'); fi; "
+          + "  rst=$(printf '%s\\n' \"$ipout\" | awk '/re-started|restarts/ {col=1; for(i=1;i<=NF;i++) if($i ~ /^re-?start/) {col=i; break} if(getline>0) print $(col)+0; exit}'); "
           + "  echo \"can.${b}=${rxp},${txp},${rxd},${txd},${rxo},${berr:-0},${rst:-0},${st:-UNKNOWN}\"; "
           + "done; "
           + "echo '[STORAGE]'; "
-          + "for d in /U/logs /home/systemcore /home/lvuser /; do "
+          + "int_mb=\"\"; usb_mb=\"\"; "
+          + "for d in /home/lvuser /home/systemcore /; do "
           + "  if [ -d \"$d\" ]; then "
-          + "    df -k \"$d\" 2>/dev/null | awk 'NR>1 && NF>=4 {avail=$(NF-2)} END {if (avail ~ /^[0-9]+$/) printf \"freeStorageMb=%.1f\\n\", avail/1024.0}'; "
-          + "    break; "
+          + "    int_mb=$(df -k \"$d\" 2>/dev/null | awk 'NR>1 && NF>=4 {avail=$(NF-2)} END {if (avail ~ /^[0-9]+$/) printf \"%.1f\", avail/1024.0}'); "
+          + "    [ -n \"$int_mb\" ] && break; "
           + "  fi; "
-          + "done";
+          + "done; "
+          + "for d in /U/logs /U; do "
+          + "  if [ -d \"$d\" ]; then "
+          + "    usb_mb=$(df -k \"$d\" 2>/dev/null | awk 'NR>1 && NF>=4 {avail=$(NF-2)} END {if (avail ~ /^[0-9]+$/) printf \"%.1f\", avail/1024.0}'); "
+          + "    [ -n \"$usb_mb\" ] && break; "
+          + "  fi; "
+          + "done; "
+          + "[ -n \"$int_mb\" ] && echo \"internalFreeStorageMb=$int_mb\"; "
+          + "[ -n \"$usb_mb\" ] && echo \"usbFreeStorageMb=$usb_mb\"; "
+          + "if [ -n \"$int_mb\" ] && [ -n \"$usb_mb\" ]; then "
+          + "  awk -v a=\"$int_mb\" -v b=\"$usb_mb\" 'BEGIN {printf \"freeStorageMb=%.1f\\n\", (a < b ? a : b)}'; "
+          + "elif [ -n \"$int_mb\" ]; then "
+          + "  echo \"freeStorageMb=$int_mb\"; "
+          + "elif [ -n \"$usb_mb\" ]; then "
+          + "  echo \"freeStorageMb=$usb_mb\"; "
+          + "fi";
 
   /** Creates a nominal healthy SystemCore baseline snapshot. */
   public static FluxSystemSnapshot healthySystemCoreBaseline() {
@@ -161,6 +275,95 @@ public record FluxSystemSnapshot(
         cans);
   }
 
+  /** Returns true when this snapshot describes a roboRIO controller. */
+  public boolean isRoboRio() {
+    return controllerType != null && controllerType.toUpperCase(Locale.ROOT).contains("ROBORIO");
+  }
+
+  /**
+   * Returns how many watch metric categories applicable to this controller have at least one
+   * measured value.
+   */
+  public int measuredMetricCount() {
+    int count = 0;
+    if (Double.isFinite(loopP99Ms) || Double.isFinite(loopMaxMs) || Double.isFinite(loopMedianMs)) {
+      count++;
+    }
+    if (Double.isFinite(driveTraceMaxMs)
+        || Double.isFinite(visionTraceMaxMs)
+        || Double.isFinite(superstructureTraceMaxMs)
+        || Double.isFinite(phoenixSignalsTraceMaxMs)
+        || Double.isFinite(commandSchedulerTraceMaxMs)
+        || Double.isFinite(robotContainerTraceMaxMs)) {
+      count++;
+    }
+    if (Double.isFinite(firstEnablePeakMs)) {
+      count++;
+    }
+    if (Double.isFinite(totalCpuPct) || Double.isFinite(javaProcessCpuPct)) {
+      count++;
+    }
+    if (Double.isFinite(softIrqPct) || Double.isFinite(ioWaitPct)) {
+      count++;
+    }
+    if (Double.isFinite(freeStorageMb)
+        || Double.isFinite(internalFreeStorageMb)
+        || Double.isFinite(usbFreeStorageMb)) {
+      count++;
+    }
+    if (!canInterfaces.isEmpty()) {
+      count++;
+    }
+    if (Double.isFinite(heapAllocRateMbPerSec) || gcCount >= 0 || gcCorrelatedLoopSpikes >= 0) {
+      count++;
+    }
+    if (!isRoboRio()) {
+      if (Double.isFinite(odometryJitterMaxMs)) {
+        count++;
+      }
+      if (Double.isFinite(visionDaemonCpuPct)) {
+        count++;
+      }
+      if (Double.isFinite(cpuTempC) || Double.isFinite(cpuFreqMHz)) {
+        count++;
+      }
+      if (throttledFlags >= 0) {
+        count++;
+      }
+      if (Double.isFinite(logWriteLatencyMaxMs)) {
+        count++;
+      }
+      if (Double.isFinite(ipc)
+          || Double.isFinite(l1dCacheMissPct)
+          || Double.isFinite(llcMissPct)
+          || involuntaryContextSwitches >= 0) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /** Returns the total number of applicable watch metrics for this controller (8 on roboRIO, 14 on SystemCore). */
+  public int applicableMetricCount() {
+    return isRoboRio() ? 8 : 14;
+  }
+
+  /**
+   * Computes an honest verdict summary ({@code CRITICAL}, {@code WARN}, {@code NO DATA}, or {@code
+   * NOMINAL}) so unmeasured snapshots never report false {@code NOMINAL}.
+   */
+  public String verdictSummary(List<WatchDecision> decisions) {
+    if (decisions != null && !decisions.isEmpty()) {
+      for (WatchDecision d : decisions) {
+        if ("CRITICAL".equalsIgnoreCase(d.severity())) {
+          return "CRITICAL";
+        }
+      }
+      return "WARN";
+    }
+    return measuredMetricCount() == 0 ? "NO DATA" : "NOMINAL";
+  }
+
   /**
    * Serializes this snapshot into the canonical {@code system-snapshot.txt} format, omitting
    * unmeasured ({@code NaN} / negative counter) fields so absent metrics are never fabricated.
@@ -184,6 +387,9 @@ public record FluxSystemSnapshot(
     appendDoubleLine(sb, "driveTraceMaxMs", "%.2f", driveTraceMaxMs);
     appendDoubleLine(sb, "visionTraceMaxMs", "%.2f", visionTraceMaxMs);
     appendDoubleLine(sb, "superstructureTraceMaxMs", "%.2f", superstructureTraceMaxMs);
+    appendDoubleLine(sb, "phoenixSignalsTraceMaxMs", "%.2f", phoenixSignalsTraceMaxMs);
+    appendDoubleLine(sb, "commandSchedulerTraceMaxMs", "%.2f", commandSchedulerTraceMaxMs);
+    appendDoubleLine(sb, "robotContainerTraceMaxMs", "%.2f", robotContainerTraceMaxMs);
 
     sb.append("\n[CPU_AND_IRQ]\n");
     appendDoubleLine(sb, "totalCpuPct", "%.1f", totalCpuPct);
@@ -231,6 +437,8 @@ public record FluxSystemSnapshot(
     appendDoubleLine(sb, "gcTotalPauseMs", "%.2f", gcTotalPauseMs);
     appendLongLine(sb, "gcCorrelatedLoopSpikes", gcCorrelatedLoopSpikes);
     appendDoubleLine(sb, "freeStorageMb", "%.1f", freeStorageMb);
+    appendDoubleLine(sb, "internalFreeStorageMb", "%.1f", internalFreeStorageMb);
+    appendDoubleLine(sb, "usbFreeStorageMb", "%.1f", usbFreeStorageMb);
     appendDoubleLine(sb, "logWriteLatencyMaxMs", "%.2f", logWriteLatencyMaxMs);
 
     sb.append("\n[HARDWARE_PMU]\n");
@@ -284,6 +492,13 @@ public record FluxSystemSnapshot(
     }
 
     String controllerType = nonBlankOrDefault(kv.get("controllerType"), "UNKNOWN");
+    double internalFreeMb = parseDoubleOrNaN(kv.get("internalFreeStorageMb"));
+    double usbFreeMb = parseDoubleOrNaN(kv.get("usbFreeStorageMb"));
+    double parsedFreeMb = parseDoubleOrNaN(kv.get("freeStorageMb"));
+    double effectiveFreeMb =
+        Double.isFinite(parsedFreeMb)
+            ? minFinite(parsedFreeMb, internalFreeMb, usbFreeMb)
+            : minFinite(internalFreeMb, usbFreeMb, Double.NaN);
 
     return new FluxSystemSnapshot(
         controllerType,
@@ -314,13 +529,18 @@ public record FluxSystemSnapshot(
         (int) parseLong(kv.get("gcCount"), -1L),
         parseDoubleOrNaN(kv.get("gcTotalPauseMs")),
         (int) parseLong(kv.get("gcCorrelatedLoopSpikes"), -1L),
-        parseDoubleOrNaN(kv.get("freeStorageMb")),
+        effectiveFreeMb,
         parseDoubleOrNaN(kv.get("logWriteLatencyMaxMs")),
         parseDoubleOrNaN(kv.get("ipc")),
         parseDoubleOrNaN(kv.get("l1dCacheMissPct")),
         parseDoubleOrNaN(kv.get("llcMissPct")),
         parseLong(kv.get("involuntaryContextSwitches"), -1L),
-        Collections.unmodifiableList(cans));
+        Collections.unmodifiableList(cans),
+        parseDoubleOrNaN(kv.get("phoenixSignalsTraceMaxMs")),
+        parseDoubleOrNaN(kv.get("commandSchedulerTraceMaxMs")),
+        parseDoubleOrNaN(kv.get("robotContainerTraceMaxMs")),
+        internalFreeMb,
+        usbFreeMb);
   }
 
   /** Formats a double metric or returns {@code "NOT MEASURED"} when {@code NaN}/infinite. */
@@ -347,37 +567,46 @@ public record FluxSystemSnapshot(
     return String.format(Locale.US, "0x%x", value);
   }
 
-  /** Evaluates all 14 offline watch metrics on this snapshot. */
+  /** Evaluates all applicable offline watch metrics on this snapshot. */
   public List<WatchDecision> evaluate() {
-    return evaluate(this, true, Double.isFinite(freeStorageMb));
+    boolean hasStorage =
+        Double.isFinite(freeStorageMb)
+            || Double.isFinite(internalFreeStorageMb)
+            || Double.isFinite(usbFreeStorageMb);
+    return evaluate(this, true, hasStorage);
   }
 
   /**
-   * Evaluates all 14 offline watch metrics across 6 categories and maps every detected anomaly to a
-   * concrete engineering, {@code FluxFig} CSV, or pit maintenance decision. Unmeasured ({@code
-   * NaN} / negative counter) fields are skipped honestly rather than triggering false alerts.
+   * Evaluates all applicable offline watch metrics across 6 categories and maps every detected
+   * anomaly to a concrete engineering, {@code FluxFig} CSV, or pit maintenance decision. Unmeasured
+   * ({@code NaN} / negative counter) fields are skipped honestly rather than triggering false
+   * alerts.
    *
    * @param s parsed or synthesized {@link FluxSystemSnapshot}
    * @param hasSnapshotFile whether a physical {@code system-snapshot.txt} file was present
-   * @param evaluateStorage whether {@code freeStorageMb} was explicitly recorded in the snapshot
+   * @param evaluateStorage whether storage space metrics were explicitly recorded in the snapshot
    */
   public static List<WatchDecision> evaluate(
       FluxSystemSnapshot s, boolean hasSnapshotFile, boolean evaluateStorage) {
     List<WatchDecision> out = new ArrayList<>();
-    boolean isRoboRio =
-        s.controllerType() != null
-            && s.controllerType().toUpperCase(Locale.ROOT).contains("ROBORIO");
+    boolean isRoboRio = s.isRoboRio();
     double effectivePeriodMs =
         Double.isFinite(s.loopPeriodMs()) && s.loopPeriodMs() > 0.0
             ? s.loopPeriodMs()
             : (isRoboRio ? 20.0 : 5.0);
+    boolean isSlowLoop = isRoboRio || effectivePeriodMs >= 15.0;
 
-    double p99LimitMs = effectivePeriodMs * 1.30; // 6.5 ms @ 200 Hz, 26.0 ms @ 50 Hz
+    double p99LimitMs = isSlowLoop ? effectivePeriodMs : effectivePeriodMs * 1.30;
+    double p99CriticalMs = isSlowLoop ? effectivePeriodMs * 1.50 : effectivePeriodMs * 1.75;
+    double maxOverrunLimitMs = effectivePeriodMs * 1.25;
+    double maxCriticalMs = effectivePeriodMs * 2.0;
+
+    String loopDecision =
+        isSlowLoop
+            ? "Decision: Profile PhoenixSignals/CommandScheduler/RobotContainer traces in AdvantageScope and move blocking CAN/vision work off the 50 Hz roboRIO main thread."
+            : "Decision: Change loopPeriodMs in parameters.csv (FluxFig) from 5 ms (200 Hz) to 10 ms (100 Hz) so ChassisSpeeds.discretize() and PID dt stay deterministic.";
+
     if (Double.isFinite(s.loopP99Ms()) && s.loopP99Ms() > p99LimitMs) {
-      String loopDecision =
-          (isRoboRio || effectivePeriodMs >= 15.0)
-              ? "Decision: Profile subsystem periodic() traces in AdvantageScope and move blocking CAN/vision work off the 50 Hz roboRIO main thread."
-              : "Decision: Change loopPeriodMs in parameters.csv (FluxFig) from 5 ms (200 Hz) to 10 ms (100 Hz) so ChassisSpeeds.discretize() and PID dt stay deterministic.";
       out.add(
           new WatchDecision(
               "1. Loop & Thread Timing",
@@ -388,7 +617,7 @@ public record FluxSystemSnapshot(
                   formatMetric(s.loopP99Ms(), "%.2f", " ms"),
                   formatMetric(s.loopMaxMs(), "%.2f", " ms")),
               String.format(Locale.US, "<= %.2f ms", p99LimitMs),
-              s.loopP99Ms() > effectivePeriodMs * 1.75 ? "CRITICAL" : "WARN",
+              s.loopP99Ms() > p99CriticalMs ? "CRITICAL" : "WARN",
               String.format(
                   Locale.US,
                   "Control loop p99 (%.2f ms) exceeded %.0f Hz budget (%.1f ms period).",
@@ -396,46 +625,153 @@ public record FluxSystemSnapshot(
                   1000.0 / effectivePeriodMs,
                   effectivePeriodMs),
               loopDecision));
-    }
-
-    boolean visionHigh = Double.isFinite(s.visionTraceMaxMs()) && s.visionTraceMaxMs() > 2.5;
-    boolean driveHigh = Double.isFinite(s.driveTraceMaxMs()) && s.driveTraceMaxMs() > 2.0;
-    boolean superHigh =
-        Double.isFinite(s.superstructureTraceMaxMs()) && s.superstructureTraceMaxMs() > 1.5;
-    if (visionHigh || driveHigh || superHigh) {
-      double vVal = Double.isFinite(s.visionTraceMaxMs()) ? s.visionTraceMaxMs() : -1.0;
-      double dVal = Double.isFinite(s.driveTraceMaxMs()) ? s.driveTraceMaxMs() : -1.0;
-      double suVal =
-          Double.isFinite(s.superstructureTraceMaxMs()) ? s.superstructureTraceMaxMs() : -1.0;
-      String culprit =
-          vVal >= dVal && vVal >= suVal
-              ? "VisionMs"
-              : (dVal >= suVal ? "DriveMs" : "SuperstructureMs");
-      double peak = Math.max(vVal, Math.max(dVal, suVal));
+    } else if (Double.isFinite(s.loopMaxMs()) && s.loopMaxMs() > maxOverrunLimitMs) {
       out.add(
           new WatchDecision(
               "1. Loop & Thread Timing",
-              "Per-Subsystem Execution Breakdown (" + culprit + ")",
+              "Control Loop Overrun (Max Loop Time)",
               String.format(
+                  Locale.US,
+                  "max=%s (p50=%s, p99=%s)",
+                  formatMetric(s.loopMaxMs(), "%.2f", " ms"),
+                  formatMetric(s.loopMedianMs(), "%.2f", " ms"),
+                  formatMetric(s.loopP99Ms(), "%.2f", " ms")),
+              String.format(Locale.US, "<= %.2f ms", maxOverrunLimitMs),
+              s.loopMaxMs() > maxCriticalMs ? "CRITICAL" : "WARN",
+              String.format(
+                  Locale.US,
+                  "Peak control loop execution (%.2f ms) overran %.0f Hz budget (%.1f ms period).",
+                  s.loopMaxMs(),
+                  1000.0 / effectivePeriodMs,
+                  effectivePeriodMs),
+              loopDecision));
+    }
+
+    double traceScale = Math.max(1.0, effectivePeriodMs / 5.0);
+    double driveLimitMs = 2.0 * traceScale;
+    double visionLimitMs = 2.5 * traceScale;
+    double superLimitMs = 1.5 * traceScale;
+    double phoenixLimitMs = 1.5 * traceScale;
+    double schedulerLimitMs = 2.5 * traceScale;
+    double containerLimitMs = 1.5 * traceScale;
+    double traceCriticalMs = 4.0 * traceScale;
+
+    boolean visionHigh =
+        Double.isFinite(s.visionTraceMaxMs()) && s.visionTraceMaxMs() > visionLimitMs;
+    boolean driveHigh = Double.isFinite(s.driveTraceMaxMs()) && s.driveTraceMaxMs() > driveLimitMs;
+    boolean superHigh =
+        Double.isFinite(s.superstructureTraceMaxMs())
+            && s.superstructureTraceMaxMs() > superLimitMs;
+    boolean phoenixHigh =
+        Double.isFinite(s.phoenixSignalsTraceMaxMs())
+            && s.phoenixSignalsTraceMaxMs() > phoenixLimitMs;
+    boolean schedulerHigh =
+        Double.isFinite(s.commandSchedulerTraceMaxMs())
+            && s.commandSchedulerTraceMaxMs() > schedulerLimitMs;
+    boolean containerHigh =
+        Double.isFinite(s.robotContainerTraceMaxMs())
+            && s.robotContainerTraceMaxMs() > containerLimitMs;
+
+    if (visionHigh || driveHigh || superHigh || phoenixHigh || schedulerHigh || containerHigh) {
+      String culprit = "DriveMs";
+      double peak = -1.0;
+      double[] vals = {
+        s.visionTraceMaxMs(),
+        s.driveTraceMaxMs(),
+        s.superstructureTraceMaxMs(),
+        s.phoenixSignalsTraceMaxMs(),
+        s.commandSchedulerTraceMaxMs(),
+        s.robotContainerTraceMaxMs()
+      };
+      double[] limits = {
+        visionLimitMs,
+        driveLimitMs,
+        superLimitMs,
+        phoenixLimitMs,
+        schedulerLimitMs,
+        containerLimitMs
+      };
+      String[] names = {
+        "VisionMs",
+        "DriveMs",
+        "SuperstructureMs",
+        "PhoenixSignalsMs",
+        "CommandSchedulerMs",
+        "RobotContainerMs"
+      };
+      for (int i = 0; i < vals.length; i++) {
+        if (Double.isFinite(vals[i]) && vals[i] > limits[i] && vals[i] > peak) {
+          peak = vals[i];
+          culprit = names[i];
+        }
+      }
+      boolean hasRoboRioTraces =
+          Double.isFinite(s.phoenixSignalsTraceMaxMs())
+              || Double.isFinite(s.commandSchedulerTraceMaxMs())
+              || Double.isFinite(s.robotContainerTraceMaxMs());
+      String measuredSummary =
+          hasRoboRioTraces
+              ? String.format(
+                  Locale.US,
+                  "PhoenixSignals=%s, CommandScheduler=%s, RobotContainer=%s",
+                  formatMetric(s.phoenixSignalsTraceMaxMs(), "%.2f", " ms"),
+                  formatMetric(s.commandSchedulerTraceMaxMs(), "%.2f", " ms"),
+                  formatMetric(s.robotContainerTraceMaxMs(), "%.2f", " ms"))
+              : String.format(
                   Locale.US,
                   "Drive=%s, Vision=%s, Super=%s",
                   formatMetric(s.driveTraceMaxMs(), "%.2f", " ms"),
                   formatMetric(s.visionTraceMaxMs(), "%.2f", " ms"),
-                  formatMetric(s.superstructureTraceMaxMs(), "%.2f", " ms")),
-              "Drive <= 2.0 ms, Vision <= 2.5 ms, Super <= 1.5 ms",
-              peak > 4.0 ? "CRITICAL" : "WARN",
+                  formatMetric(s.superstructureTraceMaxMs(), "%.2f", " ms"));
+      String thresholdSummary =
+          hasRoboRioTraces
+              ? String.format(
+                  Locale.US,
+                  "PhoenixSignals <= %.1f ms, CommandScheduler <= %.1f ms, RobotContainer <= %.1f ms",
+                  phoenixLimitMs,
+                  schedulerLimitMs,
+                  containerLimitMs)
+              : String.format(
+                  Locale.US,
+                  "Drive <= %.1f ms, Vision <= %.1f ms, Super <= %.1f ms",
+                  driveLimitMs,
+                  visionLimitMs,
+                  superLimitMs);
+      String traceDecision;
+      if ("VisionMs".equals(culprit)) {
+        traceDecision =
+            "Decision: Cap per-loop camera queue drain or tighten AprilTag max-distance/ambiguity rejection in Vision.periodic().";
+      } else if ("PhoenixSignalsMs".equals(culprit)) {
+        traceDecision =
+            "Decision: Check CANivore bus utilization (< 60%) and verify swerve/gyro StatusSignals are not double-refreshed in PhoenixSignals.refreshAll().";
+      } else if ("CommandSchedulerMs".equals(culprit)) {
+        traceDecision =
+            "Decision: Profile subsystem periodic() and active command execute() methods in AdvantageScope to remove blocking CAN or allocation spikes.";
+      } else if ("RobotContainerMs".equals(culprit)) {
+        traceDecision =
+            "Decision: Profile RobotContainer.periodicUpdate() (BatteryIO, FaultSupervisor, dashboard updates) for blocking I/O or slow loops.";
+      } else {
+        traceDecision =
+            "Decision: Move synchronous CTRE configurator .apply() calls out of periodic() into init or async background worker.";
+      }
+      out.add(
+          new WatchDecision(
+              "1. Loop & Thread Timing",
+              "Per-Subsystem Execution Breakdown (" + culprit + ")",
+              measuredSummary,
+              thresholdSummary,
+              peak > traceCriticalMs ? "CRITICAL" : "WARN",
               culprit
                   + " spiked to "
                   + String.format(Locale.US, "%.2f ms", peak)
                   + " in LoggedTracer.",
-              "VisionMs".equals(culprit)
-                  ? "Decision: Cap per-loop camera queue drain or tighten AprilTag max-distance/ambiguity rejection in Vision.periodic()."
-                  : "Decision: Move synchronous CTRE configurator .apply() calls out of periodic() into init or async background worker."));
+              traceDecision));
     }
 
+    double firstEnableLimitMs = Math.max(12.0, effectivePeriodMs * 2.4);
     if (Double.isFinite(s.firstEnablePeakMs())
         && Double.isFinite(s.loopMedianMs())
-        && s.firstEnablePeakMs() > Math.max(12.0, effectivePeriodMs * 2.4)
+        && s.firstEnablePeakMs() > firstEnableLimitMs
         && s.loopMedianMs() > 0.0
         && s.loopMedianMs() < effectivePeriodMs * 0.7) {
       out.add(
@@ -447,7 +783,7 @@ public record FluxSystemSnapshot(
                   "FirstEnable=%.2f ms vs Median=%.2f ms",
                   s.firstEnablePeakMs(),
                   s.loopMedianMs()),
-              "<= 12.0 ms",
+              String.format(Locale.US, "<= %.1f ms", firstEnableLimitMs),
               "WARN",
               "First Autonomous loop spiked due to cold JVM C2 JIT compilation.",
               "Decision: Add dummy warmup iterations for PathPlanner trajectory follower, ShotCalculator, and ZeroPriorBootstrapSolver inside robotInit()."));
@@ -522,7 +858,7 @@ public record FluxSystemSnapshot(
                     can.canState(),
                     can.busErrorCount(),
                     can.busRestarts()),
-                "ERROR-ACTIVE, berr=0",
+                "ERROR-ACTIVE, berr=0, restarts=0",
                 "BUS-OFF".equalsIgnoreCase(can.canState()) || can.busRestarts() > 0 || badState
                     ? "CRITICAL"
                     : "WARN",
@@ -646,27 +982,52 @@ public record FluxSystemSnapshot(
               gcDecision));
     }
 
-    boolean lowFreeStorage =
-        evaluateStorage && Double.isFinite(s.freeStorageMb()) && s.freeStorageMb() < 400.0;
+    double minFreeMb =
+        minFinite(s.freeStorageMb(), s.internalFreeStorageMb(), s.usbFreeStorageMb());
+    boolean lowInternalStorage =
+        evaluateStorage
+            && Double.isFinite(s.internalFreeStorageMb())
+            && s.internalFreeStorageMb() < 400.0;
+    boolean lowUsbStorage =
+        evaluateStorage && Double.isFinite(s.usbFreeStorageMb()) && s.usbFreeStorageMb() < 400.0;
+    boolean lowFreeStorage = evaluateStorage && Double.isFinite(minFreeMb) && minFreeMb < 400.0;
     boolean highIoWait = Double.isFinite(s.ioWaitPct()) && s.ioWaitPct() > 5.0;
     boolean highLogLatency =
         Double.isFinite(s.logWriteLatencyMaxMs()) && s.logWriteLatencyMaxMs() > 25.0;
     if (hasSnapshotFile && (lowFreeStorage || highIoWait || highLogLatency)) {
+      String storageMeasured;
+      if (Double.isFinite(s.internalFreeStorageMb()) || Double.isFinite(s.usbFreeStorageMb())) {
+        storageMeasured =
+            String.format(
+                Locale.US,
+                "Internal=%s, USB=%s, iowait=%s, writeMax=%s",
+                formatMetric(s.internalFreeStorageMb(), "%.0f", " MB"),
+                formatMetric(s.usbFreeStorageMb(), "%.0f", " MB"),
+                formatMetric(s.ioWaitPct(), "%.1f", "%"),
+                formatMetric(s.logWriteLatencyMaxMs(), "%.1f", " ms"));
+      } else {
+        storageMeasured =
+            String.format(
+                Locale.US,
+                "Free=%s, iowait=%s, writeMax=%s",
+                formatMetric(s.freeStorageMb(), "%.0f", " MB"),
+                formatMetric(s.ioWaitPct(), "%.1f", "%"),
+                formatMetric(s.logWriteLatencyMaxMs(), "%.1f", " ms"));
+      }
+      String storageSummary =
+          lowInternalStorage && !lowUsbStorage
+              ? "Internal flash (/home/lvuser) is low even though USB (/U/logs) has space."
+              : "Storage pressure or disk write latency spikes detected during match logging.";
       out.add(
           new WatchDecision(
               "5. Storage & eMMC I/O",
-              "eMMC Free Space & Log I/O Wait",
-              String.format(
-                  Locale.US,
-                  "Free=%s, iowait=%s, writeMax=%s",
-                  formatMetric(s.freeStorageMb(), "%.0f", " MB"),
-                  formatMetric(s.ioWaitPct(), "%.1f", "%"),
-                  formatMetric(s.logWriteLatencyMaxMs(), "%.1f", " ms")),
-              "Free >= 400 MB, iowait <= 5.0%",
-              (evaluateStorage && Double.isFinite(s.freeStorageMb()) && s.freeStorageMb() < 150.0)
+              "Flash Free Space & Log I/O Wait",
+              storageMeasured,
+              "Free >= 400 MB (internal & USB), iowait <= 5.0%",
+              (evaluateStorage && Double.isFinite(minFreeMb) && minFreeMb < 150.0)
                   ? "CRITICAL"
                   : "WARN",
-              "Storage pressure or disk write latency spikes detected during match logging.",
+              storageSummary,
               "Decision: Clean old robot logs on /home/lvuser/logs or /U/logs and verify SignalLogger.enableAutoLogging(false) is active."));
     }
 
@@ -693,6 +1054,20 @@ public record FluxSystemSnapshot(
     }
 
     return Collections.unmodifiableList(out);
+  }
+
+  private static double minFinite(double a, double b, double c) {
+    double best = Double.NaN;
+    if (Double.isFinite(a)) {
+      best = a;
+    }
+    if (Double.isFinite(b)) {
+      best = Double.isFinite(best) ? Math.min(best, b) : b;
+    }
+    if (Double.isFinite(c)) {
+      best = Double.isFinite(best) ? Math.min(best, c) : c;
+    }
+    return best;
   }
 
   private static void appendStringLine(StringBuilder sb, String key, String value) {

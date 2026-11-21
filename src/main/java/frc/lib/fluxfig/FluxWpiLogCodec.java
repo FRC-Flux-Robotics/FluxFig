@@ -277,6 +277,9 @@ public final class FluxWpiLogCodec {
   }
 
   public static ParsedLog parseBuffer(Path sourcePath, ByteBuffer buf) throws IOException {
+    if (buf == null || buf.remaining() < 12) {
+      throw new IOException("Invalid .wpilog buffer (too small): " + sourcePath);
+    }
     buf.order(ByteOrder.LITTLE_ENDIAN);
     for (byte b : MAGIC) {
       if (buf.get() != b) {
@@ -343,7 +346,7 @@ public final class FluxWpiLogCodec {
           }
         }
       } else {
-        boolean isMonotonicTs = ts >= 0 && ts < 100_000_000_000L;
+        boolean isMonotonicTs = ts >= 0L;
         if (isMonotonicTs) {
           if (ts > 0 && ts < minTs) {
             minTs = ts;

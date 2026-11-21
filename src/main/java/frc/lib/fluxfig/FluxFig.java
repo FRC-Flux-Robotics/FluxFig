@@ -1550,7 +1550,18 @@ public final class FluxFig {
   public synchronized double getDouble(String key) {
     String raw = getString(key);
     try {
-      return Double.parseDouble(raw.trim());
+      double parsed = Double.parseDouble(raw.trim());
+      if (!Double.isFinite(parsed)) {
+        throw new IllegalArgumentException(
+            "parameters.csv [profile '"
+                + activeProfile
+                + "', key '"
+                + key
+                + "']: non-finite double value '"
+                + raw
+                + "'");
+      }
+      return parsed;
     } catch (NumberFormatException e) {
       throw new IllegalArgumentException(
           "parameters.csv [profile '"
@@ -1582,7 +1593,19 @@ public final class FluxFig {
   }
 
   public synchronized boolean getBoolean(String key) {
-    return Boolean.parseBoolean(getString(key));
+    String raw = getString(key);
+    try {
+      return FluxFigRecordBinder.parseStrictBoolean(raw.trim());
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException(
+          "parameters.csv [profile '"
+              + activeProfile
+              + "', key '"
+              + key
+              + "']: "
+              + e.getMessage(),
+          e);
+    }
   }
 
   /** Returns the names of all discovered relational table tabs (without {@code .csv} suffix). */

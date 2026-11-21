@@ -299,6 +299,9 @@ final class FluxFigRecordBinder {
         || targetType == Double.class
         || targetType == float.class
         || targetType == Float.class) {
+      if (cause.getMessage() != null && cause.getMessage().startsWith("non-finite number")) {
+        return cause.getMessage();
+      }
       return "invalid number '" + trimmedValue + "'";
     }
     if (targetType == int.class
@@ -307,10 +310,24 @@ final class FluxFigRecordBinder {
         || targetType == Long.class) {
       return "invalid integer '" + trimmedValue + "'";
     }
+    if (targetType == boolean.class || targetType == Boolean.class) {
+      return cause.getMessage();
+    }
     if (targetType.isEnum()) {
       return cause.getMessage();
     }
     return "invalid " + targetType.getSimpleName() + " value '" + trimmedValue + "'";
+  }
+
+  static boolean parseStrictBoolean(String trimmed) {
+    if ("true".equalsIgnoreCase(trimmed)) {
+      return true;
+    }
+    if ("false".equalsIgnoreCase(trimmed)) {
+      return false;
+    }
+    throw new IllegalArgumentException(
+        "invalid boolean '" + trimmed + "' (expected 'true' or 'false')");
   }
 
   @SuppressWarnings({"unchecked", "rawtypes"})
@@ -326,13 +343,21 @@ final class FluxFigRecordBinder {
       return trimmed.isEmpty() ? 0L : Long.parseLong(trimmed);
     }
     if (targetType == double.class || targetType == Double.class) {
-      return trimmed.isEmpty() ? 0.0 : Double.parseDouble(trimmed);
+      double parsed = trimmed.isEmpty() ? 0.0 : Double.parseDouble(trimmed);
+      if (!Double.isFinite(parsed)) {
+        throw new IllegalArgumentException("non-finite number '" + trimmed + "'");
+      }
+      return parsed;
     }
     if (targetType == float.class || targetType == Float.class) {
-      return trimmed.isEmpty() ? 0.0f : Float.parseFloat(trimmed);
+      float parsed = trimmed.isEmpty() ? 0.0f : Float.parseFloat(trimmed);
+      if (!Float.isFinite(parsed)) {
+        throw new IllegalArgumentException("non-finite number '" + trimmed + "'");
+      }
+      return parsed;
     }
     if (targetType == boolean.class || targetType == Boolean.class) {
-      return !trimmed.isEmpty() && Boolean.parseBoolean(trimmed);
+      return parseStrictBoolean(trimmed);
     }
     if (targetType.isEnum()) {
       Class<Enum> enumClass = (Class<Enum>) targetType;

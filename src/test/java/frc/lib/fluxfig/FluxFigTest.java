@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -117,6 +118,9 @@ public final class FluxFigTest {
       testTuningVsProductionModeDistanceTableInterpolationAndReleaseHarvest();
       testResolvedCanBusCollisionValidationHierarchicalTableOverrideAndBatterySave();
       testSharedFluxSystemSnapshotAndFluxWpiLogCodec();
+      testWpiLogLongUptimeAndShortBufferGuards();
+      testRoboRio2SnapshotCaptureParsingAndEvaluation();
+      testHardwareSafetyValidatorBypassesClosed();
       System.out.println("FluxFigTest: ALL TESTS PASSED");
     } finally {
       cleanupTempPaths();
@@ -147,8 +151,8 @@ public final class FluxFigTest {
     String rangeLf =
         """
         distanceMeters,shooterRps,hoodRotations,timeOfFlightSec
-        2.0,60.0,2.40,0.32
-        4.0,78.0,6.45,0.54
+        2.0,34.0,2.40,0.32
+        4.0,39.5,6.45,0.54
         """;
     String batsLf =
         """
@@ -1085,5 +1089,408 @@ public final class FluxFigTest {
         !gcDecision.actionableDecision().contains("UseZGC")
             && gcDecision.actionableDecision().contains("UseSerialGC"),
         "roboRIO GC advice must never recommend 64-bit ZGC: " + gcDecision.actionableDecision());
+  }
+
+  private static void testWpiLogLongUptimeAndShortBufferGuards() throws Exception {
+    Path logFile = createTempFile("fluxfig-wpilog-long-uptime-", ".wpilog");
+    long ts1 = 150_000_000_000L;
+    long ts2 = 150_002_500_000L;
+    try (FluxWpiLogCodec.Writer writer = new FluxWpiLogCodec.Writer(logFile, "LONG-UPTIME")) {
+      int loopId = writer.startEntry("/Performance/TotalLoopMs", "double", "", ts1);
+      int enabledId = writer.startEntry("/DriverStation/Enabled", "boolean", "", ts1);
+      writer.appendDouble(loopId, ts1, 8.25);
+      writer.appendDouble(loopId, ts2, 12.75);
+      writer.appendBoolean(enabledId, ts1, true);
+    }
+
+    FluxWpiLogCodec.ParsedLog parsed = FluxWpiLogCodec.read(logFile);
+    check(
+        parsed.getDoubleSeries("/Performance/TotalLoopMs").size() == 2,
+        "Samples beyond 27.77 h uptime (150e9 us) must not be dropped");
+    check(
+        parsed.minTimestampUs() == ts1 && parsed.maxTimestampUs() == ts2,
+        "Expected exact min/max timestamps at 150e9 us, got "
+            + parsed.minTimestampUs()
+            + ".."
+            + parsed.maxTimestampUs());
+    check(
+        Math.abs(parsed.durationSeconds() - 2.5) < 1e-6,
+        "Expected 2.5 s duration, got " + parsed.durationSeconds());
+    check(
+        parsed.getBooleanSeries("/DriverStation/Enabled").size() == 1
+            && parsed.getBooleanSeries("/DriverStation/Enabled").get(0).value(),
+        "Boolean sample at 150e9 us must be retained");
+
+    for (byte[] shortBytes : new byte[][] {new byte[0], new byte[6], new byte[11]}) {
+      boolean threwIo = false;
+      try {
+        FluxWpiLogCodec.parseBuffer(Path.of("short.wpilog"), ByteBuffer.wrap(shortBytes));
+      } catch (IOException expected) {
+        threwIo = true;
+      }
+      check(
+          threwIo,
+          "parseBuffer() must throw IOException (not BufferUnderflowException) for "
+              + shortBytes.length
+              + "-byte buffer");
+    }
+    boolean nullThrewIo = false;
+    try {
+      FluxWpiLogCodec.parseBuffer(Path.of("null.wpilog"), null);
+    } catch (IOException expected) {
+      nullThrewIo = true;
+    }
+    check(nullThrewIo, "parseBuffer() must throw IOException for null buffer");
+  }
+
+  private static void testRoboRio2SnapshotCaptureParsingAndEvaluation() throws Exception {
+    String cmd = FluxSystemSnapshot.REMOTE_CAPTURE_SH_COMMAND;
+    check(
+        cmd.contains("s1=") && cmd.contains("s2=") && cmd.contains("sleep 0.2"),
+        "REMOTE_CAPTURE_SH_COMMAND must take a delta /proc/stat CPU sample");
+    check(
+        cmd.contains("top -b -n 1"),
+        "REMOTE_CAPTURE_SH_COMMAND must provide BusyBox top fallback when ps -eo is unavailable");
+    check(
+        cmd.contains("internalFreeStorageMb") && cmd.contains("usbFreeStorageMb"),
+        "REMOTE_CAPTURE_SH_COMMAND must report /home/lvuser internal flash and /U/logs USB separately");
+    check(
+        cmd.contains("re-started"),
+        "REMOTE_CAPTURE_SH_COMMAND must parse iproute2 're-started' header");
+
+    // Verify the exact iproute2 're-started' ($1) awk parser on realistic SocketCAN output.
+    String sampleIpLinkOutput =
+        "3: can0: <NOARP,UP,LOWER_UP,ECHO> mtu 16 qdisc pfifo_fast state UP mode DEFAULT qlen 10\n"
+            + "    link/can  promiscuity 0 minmtu 0 maxmtu 0\n"
+            + "    can state ERROR-ACTIVE (berr-counter tx 0 rx 0) restart-ms 0\n"
+            + "    re-started bus-errors arbit-lost error-warn error-pass bus-off\n"
+            + "    3          5          0          1          0          0\n";
+    Process proc =
+        new ProcessBuilder(
+                "sh",
+                "-c",
+                "awk '/re-started|restarts/ {col=1; for(i=1;i<=NF;i++) if($i ~ /^re-?start/) {col=i; break} if(getline>0) print $(col)+0; exit}'")
+            .start();
+    try (OutputStream os = proc.getOutputStream()) {
+      os.write(sampleIpLinkOutput.getBytes(StandardCharsets.UTF_8));
+    }
+    String rstOut = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+    check(proc.waitFor() == 0 && "3".equals(rstOut), "Expected re-started=3, got '" + rstOut + "'");
+
+    // RoboRIO 2.0 snapshot with TotalLoopMs overrun, PhoenixSignalsMs spike, /home/lvuser low flash
+    // (hidden behind large USB stick before fix), and CAN re-started=2.
+    FluxSystemSnapshot rioOverrunSnap =
+        FluxSystemSnapshot.parse(
+            """
+            [PLATFORM]
+            controllerType=ROBORIO
+            hostname=roboRIO-10413-FRC
+            [LOOP_AND_TIMING]
+            loopPeriodMs=20.0
+            loopMedianMs=7.80
+            loopP99Ms=23.50
+            loopMaxMs=31.20
+            phoenixSignalsTraceMaxMs=8.40
+            commandSchedulerTraceMaxMs=6.10
+            robotContainerTraceMaxMs=1.90
+            [CPU_AND_IRQ]
+            totalCpuPct=52.0
+            javaProcessCpuPct=38.0
+            [SOCKETCAN]
+            can.can0=42000,18000,0,0,0,0,2,ERROR-ACTIVE
+            [STORAGE]
+            internalFreeStorageMb=110.0
+            usbFreeStorageMb=14800.0
+            freeStorageMb=110.0
+            """);
+    check(rioOverrunSnap.isRoboRio(), "Snapshot must identify as roboRIO");
+    check(
+        rioOverrunSnap.applicableMetricCount() == 8,
+        "roboRIO applicable metric count must reflect roboRIO hardware (8), got "
+            + rioOverrunSnap.applicableMetricCount());
+    check(
+        Math.abs(rioOverrunSnap.internalFreeStorageMb() - 110.0) < 1e-6
+            && Math.abs(rioOverrunSnap.usbFreeStorageMb() - 14800.0) < 1e-6,
+        "Internal and USB storage must both round-trip");
+    FluxSystemSnapshot rioRoundTrip = FluxSystemSnapshot.parse(rioOverrunSnap.serialize());
+    List<FluxSystemSnapshot.WatchDecision> rioDecisions = rioRoundTrip.evaluate();
+    check(
+        rioDecisions.stream().anyMatch(d -> d.metricName().contains("Loop Period Jitter")),
+        "TotalLoopMs p99=23.5ms on 20ms roboRIO must trigger loop jitter decision: " + rioDecisions);
+    check(
+        rioDecisions.stream().anyMatch(d -> d.metricName().contains("PhoenixSignalsMs")),
+        "PhoenixSignalsMs=8.4ms on 20ms roboRIO must trigger subsystem breakdown: " + rioDecisions);
+    check(
+        rioDecisions.stream()
+            .anyMatch(
+                d ->
+                    d.category().contains("Storage")
+                        && "CRITICAL".equals(d.severity())
+                        && d.measuredValue().contains("Internal=110 MB")
+                        && d.measuredValue().contains("USB=14800 MB")),
+        "Low /home/lvuser flash (110 MB) must trigger CRITICAL even with 14.8 GB USB: "
+            + rioDecisions);
+    check(
+        rioDecisions.stream()
+            .anyMatch(
+                d ->
+                    d.metricName().contains("CAN Error State")
+                        && "CRITICAL".equals(d.severity())
+                        && d.measuredValue().contains("restarts=2")),
+        "CAN re-started=2 must trigger CRITICAL CAN alert: " + rioDecisions);
+    check(
+        "CRITICAL".equals(rioRoundTrip.verdictSummary(rioDecisions)),
+        "Expected CRITICAL verdictSummary");
+
+    // Verify single-loop TotalLoopMs max overrun fires even when p99 is within 20 ms budget.
+    FluxSystemSnapshot rioPeakOnly =
+        FluxSystemSnapshot.parse(
+            """
+            [PLATFORM]
+            controllerType=ROBORIO
+            [LOOP_AND_TIMING]
+            loopPeriodMs=20.0
+            loopMedianMs=6.50
+            loopP99Ms=14.00
+            loopMaxMs=29.00
+            """);
+    List<FluxSystemSnapshot.WatchDecision> peakDecisions = rioPeakOnly.evaluate();
+    check(
+        peakDecisions.stream().anyMatch(d -> d.metricName().contains("Control Loop Overrun")),
+        "Single-loop TotalLoopMs=29ms overrun on 20ms roboRIO must fire alert: " + peakDecisions);
+
+    // Honest NO DATA verdict on completely unmeasured snapshot (never false NOMINAL).
+    FluxSystemSnapshot emptySnap = FluxSystemSnapshot.parse("[PLATFORM]\ncontrollerType=ROBORIO\n");
+    check(
+        "NO DATA".equals(emptySnap.verdictSummary(emptySnap.evaluate())),
+        "Unmeasured roboRIO snapshot must return NO DATA verdict, got "
+            + emptySnap.verdictSummary(emptySnap.evaluate()));
+  }
+
+  private static void testHardwareSafetyValidatorBypassesClosed() throws Exception {
+    // Baseline valid multi-robot config matching FUEL + COMP_2027 (including SwerveDriveFL row).
+    Map<String, String> validBase = new LinkedHashMap<>();
+    validBase.put(
+        "parameters.csv",
+        """
+        key,DEFAULT,COMP_2027,FUEL
+        controllerProfile,ROBORIO_CANIVORE_2026,SYSTEMCORE_2027,ROBORIO_CANIVORE_2026
+        loopPeriodMs,20,5,20
+        swerveCanBus,Drivetrain,can_s0,Drivetrain
+        mechCanBus,Mech,can_s2,Mech
+        auxCanBus,rio,can_s4,rio
+        simulateMissingMechanisms,false,false,false
+        maxLinearSpeedMps,4.5,4.8,4.5
+        maxAngularSpeedRadPerSec,4.71,10.5,4.71
+        driveStatorLimitAmps,60.0,60.0,60.0
+        driveSupplyLimitAmps,40.0,40.0,40.0
+        driveSlipCurrentAmps,60.0,60.0,60.0
+        pigeonId,20,20,20
+        trackWidthMeters,0.56515,0.56515,0.56515
+        wheelBaseMeters,0.56515,0.56515,0.56515
+        wheelRadiusMeters,0.0508,0.0508,0.0508
+        driveGearRatio,6.3947,6.3947,6.3947
+        turnGearRatio,12.1,12.1,12.1
+        """);
+    validBase.put(
+        "mechanisms.csv",
+        """
+        robot,mechanism,motorId,canBus,statorLimitAmps,supplyLimitAmps,slipCurrentAmps,gravityType,kP,kI,kD,kS,kV,kA,kG,minPosRot,maxPosRot,followerMotorId,invertFollower,motorInverted,gearRatio
+        FUEL,SwerveDriveFL,1,Drivetrain,60.0,40.0,60.0,NONE,0.90,0.0,0.0,0.14,0.79,0.10,0.0,-10000.0,10000.0,-1,false,false,6.3947
+        FUEL,Shooter,11,$mechCanBus,60.0,40.0,60.0,NONE,0.35,0.0,0.0,0.20,0.118,0.018,0.0,-10000.0,10000.0,10,true,true,1.0
+        FUEL,Hood,12,Mech,40.0,25.0,40.0,NONE,2.80,0.0,0.05,0.16,0.150,0.010,0.0,0.0,12.5,-1,false,false,1.0
+        """);
+    validBase.put(
+        "swerve_modules.csv",
+        """
+        robot,corner,driveMotorId,turnMotorId,cancoderId,encoderOffsetRot,invertDrive,invertTurn
+        FUEL,FL,2,1,21,0.1052,false,false
+        FUEL,FR,4,3,22,-0.1206,true,false
+        FUEL,BL,6,5,23,-0.4667,false,false
+        FUEL,BR,8,7,24,-0.0371,true,false
+        """);
+    validBase.put(
+        "range_table.csv",
+        """
+        distanceMeters,shooterRps,hoodRotations,timeOfFlightSec
+        1.22,33.33,0.00,0.22
+        2.84,36.67,3.90,0.40
+        4.67,40.00,8.85,0.62
+        """);
+    FluxFig baseFig = FluxFig.fromCsvMap(validBase, "FUEL");
+    List<String> baseErrors = baseFig.validateStrict();
+    check(baseErrors.isEmpty(), "Valid multi-table baseline must pass validateStrict: " + baseErrors);
+
+    // Bypass (1): NaN / Infinity in numeric PID/FF gains and parameters.
+    Map<String, String> nanMechs = new LinkedHashMap<>(validBase);
+    nanMechs.put(
+        "mechanisms.csv",
+        validBase.get("mechanisms.csv").replace("0.35,0.0,0.0", "NaN,0.0,Infinity"));
+    List<String> nanErrors = FluxFig.fromCsvMap(nanMechs, "FUEL").validateStrict();
+    check(
+        nanErrors.stream().anyMatch(e -> e.contains("non-finite")),
+        "validateStrict() must reject NaN/Infinity in mechanism PID/FF gains: " + nanErrors);
+
+    Map<String, String> nanParam = new LinkedHashMap<>(validBase);
+    nanParam.put(
+        "parameters.csv", validBase.get("parameters.csv").replace("4.5,4.8,4.5", "4.5,NaN,4.5"));
+    FluxFig nanParamFig = FluxFig.fromCsvMap(nanParam, "COMP_2027");
+    check(
+        nanParamFig.validateStrict().stream().anyMatch(e -> e.contains("non-finite")),
+        "validateStrict() must reject NaN in parameters.csv");
+    boolean getDoubleRejectedNaN = false;
+    try {
+      nanParamFig.getDouble("maxLinearSpeedMps");
+    } catch (IllegalArgumentException expected) {
+      getDoubleRejectedNaN = true;
+    }
+    check(getDoubleRejectedNaN, "getDouble() must reject NaN");
+
+    // Bypass (2): Invalid boolean typos (motorInverted=ture, invertFollower=1, simulateMissingMechanisms=ture).
+    Map<String, String> badBoolMechs = new LinkedHashMap<>(validBase);
+    badBoolMechs.put(
+        "mechanisms.csv", validBase.get("mechanisms.csv").replace("10,true,true", "10,1,ture"));
+    List<String> badBoolMechErrors = FluxFig.fromCsvMap(badBoolMechs, "FUEL").validateStrict();
+    check(
+        badBoolMechErrors.stream().anyMatch(e -> e.contains("invalid boolean")),
+        "validateStrict() must reject invalid boolean typos in mechanisms.csv: "
+            + badBoolMechErrors);
+
+    Map<String, String> badBoolParams = new LinkedHashMap<>(validBase);
+    badBoolParams.put(
+        "parameters.csv",
+        validBase.get("parameters.csv").replace("false,false,false", "false,false,ture"));
+    FluxFig badBoolParamFig = FluxFig.fromCsvMap(badBoolParams, "FUEL");
+    check(
+        badBoolParamFig.validateStrict().stream().anyMatch(e -> e.contains("invalid boolean")),
+        "validateStrict() must reject invalid boolean typo in parameters.csv");
+    boolean getBoolRejectedTypo = false;
+    try {
+      badBoolParamFig.getBoolean("simulateMissingMechanisms");
+    } catch (IllegalArgumentException expected) {
+      getBoolRejectedTypo = true;
+    }
+    check(getBoolRejectedTypo, "getBoolean() must reject 'ture' instead of silently returning false");
+
+    // Bypass (3): $mechCanBus vs literal "Mech" CAN ID collision (both row orders).
+    Map<String, String> refThenLiteral = new LinkedHashMap<>(validBase);
+    refThenLiteral.put(
+        "mechanisms.csv",
+        """
+        robot,mechanism,motorId,canBus,statorLimitAmps,supplyLimitAmps,slipCurrentAmps,gravityType,kP,kI,kD,kS,kV,kA,kG,minPosRot,maxPosRot,followerMotorId,invertFollower,motorInverted,gearRatio
+        FUEL,Shooter,11,$mechCanBus,60.0,40.0,60.0,NONE,0.35,0.0,0.0,0.20,0.118,0.018,0.0,-10000.0,10000.0,-1,false,false,1.0
+        FUEL,Hood,11,Mech,40.0,25.0,40.0,NONE,2.80,0.0,0.05,0.16,0.150,0.010,0.0,0.0,12.5,-1,false,false,1.0
+        """);
+    List<String> refLitErrors = FluxFig.fromCsvMap(refThenLiteral, "FUEL").validateStrict();
+    check(
+        refLitErrors.stream()
+            .anyMatch(e -> e.contains("Duplicate resolved CAN ID") && e.contains("FUEL|Mech|11")),
+        "validateStrict() must catch $mechCanBus vs literal 'Mech' CAN ID collision: "
+            + refLitErrors);
+
+    Map<String, String> literalThenRef = new LinkedHashMap<>(validBase);
+    literalThenRef.put(
+        "mechanisms.csv",
+        """
+        robot,mechanism,motorId,canBus,statorLimitAmps,supplyLimitAmps,slipCurrentAmps,gravityType,kP,kI,kD,kS,kV,kA,kG,minPosRot,maxPosRot,followerMotorId,invertFollower,motorInverted,gearRatio
+        FUEL,Hood,11,Mech,40.0,25.0,40.0,NONE,2.80,0.0,0.05,0.16,0.150,0.010,0.0,0.0,12.5,-1,false,false,1.0
+        FUEL,Shooter,11,$mechCanBus,60.0,40.0,60.0,NONE,0.35,0.0,0.0,0.20,0.118,0.018,0.0,-10000.0,10000.0,-1,false,false,1.0
+        """);
+    List<String> litRefErrors = FluxFig.fromCsvMap(literalThenRef, "FUEL").validateStrict();
+    check(
+        litRefErrors.stream()
+            .anyMatch(e -> e.contains("Duplicate resolved CAN ID") && e.contains("FUEL|Mech|11")),
+        "validateStrict() must catch literal 'Mech' vs $mechCanBus CAN ID collision regardless of order: "
+            + litRefErrors);
+
+    // Bypass (4a): swerve_modules.csv invalid corners, CAN ID collisions, pigeonId collision, and
+    // cross-table collision against mechanisms.csv.
+    Map<String, String> badSwerve = new LinkedHashMap<>(validBase);
+    badSwerve.put(
+        "mechanisms.csv",
+        validBase.get("mechanisms.csv")
+            + "FUEL,RogueClimber,4,Drivetrain,50.0,35.0,50.0,NONE,1.0,0,0,0,0,0,0,0,10,-1,false,false,1.0\n");
+    badSwerve.put(
+        "swerve_modules.csv",
+        """
+        robot,corner,driveMotorId,turnMotorId,cancoderId,encoderOffsetRot,invertDrive,invertTurn
+        FUEL,FL,2,1,20,0.1052,false,yes
+        FUEL,FR,4,3,65,-0.1206,true,false
+        FUEL,XX,2,5,23,-0.4667,false,false
+        FUEL,BR,8,7,24,-0.0371,true,false
+        """);
+    List<String> swerveErrors = FluxFig.fromCsvMap(badSwerve, "FUEL").validateStrict();
+    check(
+        swerveErrors.stream().anyMatch(e -> e.contains("invalid corner 'XX'")),
+        "Expected invalid swerve corner error: " + swerveErrors);
+    check(
+        swerveErrors.stream().anyMatch(e -> e.contains("missing required swerve corner 'BL'")),
+        "Expected missing swerve corner BL error: " + swerveErrors);
+    check(
+        swerveErrors.stream().anyMatch(e -> e.contains("cancoderId must be in [0, 62]")),
+        "Expected out-of-range cancoderId error: " + swerveErrors);
+    check(
+        swerveErrors.stream().anyMatch(e -> e.contains("collides with pigeonId=20")),
+        "Expected swerve CAN ID vs pigeonId collision error: " + swerveErrors);
+    check(
+        swerveErrors.stream().anyMatch(e -> e.contains("Cross-table CAN ID collision")),
+        "Expected cross-table mechanisms.csv vs swerve_modules.csv collision error: " + swerveErrors);
+    check(
+        swerveErrors.stream().anyMatch(e -> e.contains("invalid boolean 'yes'")),
+        "Expected strict boolean check on swerve_modules.csv invertTurn: " + swerveErrors);
+
+    // Bypass (4b): range_table.csv non-monotonic distances and unsafe shooterRps > 45.0.
+    Map<String, String> badRange = new LinkedHashMap<>(validBase);
+    badRange.put(
+        "range_table.csv",
+        """
+        distanceMeters,shooterRps,hoodRotations,timeOfFlightSec
+        2.50,35.0,2.0,0.30
+        2.00,60.0,-0.5,0.40
+        """);
+    List<String> rangeErrors = FluxFig.fromCsvMap(badRange, "FUEL").validateStrict();
+    check(
+        rangeErrors.stream().anyMatch(e -> e.contains("strictly increasing")),
+        "validateStrict() must reject non-monotonic range_table.csv distances: " + rangeErrors);
+    check(
+        rangeErrors.stream().anyMatch(e -> e.contains("shooterRps") && e.contains("45.0")),
+        "validateStrict() must reject unsafe range_table.csv shooterRps > 45.0: " + rangeErrors);
+    check(
+        rangeErrors.stream().anyMatch(e -> e.contains("hoodRotations")),
+        "validateStrict() must reject negative range_table.csv hoodRotations: " + rangeErrors);
+
+    // Bypass (5): Invalid physical constants in parameters.csv and unresolved $typoCanBus.
+    Map<String, String> badPhysicalAndRef = new LinkedHashMap<>(validBase);
+    badPhysicalAndRef.put(
+        "parameters.csv",
+        validBase
+            .get("parameters.csv")
+            .replace("loopPeriodMs,20,5,20", "loopPeriodMs,20,5,0")
+            .replace("driveGearRatio,6.3947,6.3947,6.3947", "driveGearRatio,6.3947,-1.0,6.3947")
+            .replace("wheelRadiusMeters,0.0508,0.0508,0.0508", "wheelRadiusMeters,0.0,0.0508,0.0508")
+            .replace("maxLinearSpeedMps,4.5,4.8,4.5", "maxLinearSpeedMps,4.5,4.8,-2.0")
+            .replace("pigeonId,20,20,20", "pigeonId,20,20,70"));
+    badPhysicalAndRef.put(
+        "mechanisms.csv",
+        validBase.get("mechanisms.csv").replace("$mechCanBus", "$typoCanBus"));
+    List<String> physErrors = FluxFig.fromCsvMap(badPhysicalAndRef, "FUEL").validateStrict();
+    check(
+        physErrors.stream().anyMatch(e -> e.contains("loopPeriodMs")),
+        "validateStrict() must reject loopPeriodMs <= 0: " + physErrors);
+    check(
+        physErrors.stream().anyMatch(e -> e.contains("driveGearRatio")),
+        "validateStrict() must reject driveGearRatio <= 0: " + physErrors);
+    check(
+        physErrors.stream().anyMatch(e -> e.contains("wheelRadiusMeters")),
+        "validateStrict() must reject wheelRadiusMeters <= 0: " + physErrors);
+    check(
+        physErrors.stream().anyMatch(e -> e.contains("maxLinearSpeedMps")),
+        "validateStrict() must reject maxLinearSpeedMps <= 0: " + physErrors);
+    check(
+        physErrors.stream().anyMatch(e -> e.contains("pigeonId must be in [0, 62]")),
+        "validateStrict() must reject out-of-range pigeonId: " + physErrors);
+    check(
+        physErrors.stream().anyMatch(e -> e.contains("Unresolved CAN bus reference '$typoCanBus'")),
+        "validateStrict() must reject unresolved $typoCanBus reference: " + physErrors);
   }
 }
