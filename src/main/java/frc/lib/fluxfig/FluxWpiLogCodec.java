@@ -25,6 +25,7 @@ public final class FluxWpiLogCodec {
 
   private static final byte[] MAGIC = "WPILOG".getBytes(StandardCharsets.US_ASCII);
   private static final int CONTROL_START = 0;
+  private static final int CONTROL_FINISH = 1;
   private static final int CONTROL_SET_METADATA = 2;
 
   private FluxWpiLogCodec() {}
@@ -159,6 +160,15 @@ public final class FluxWpiLogCodec {
       return id;
     }
 
+    /** Emits a WPILOG {@code CONTROL_FINISH} record closing an active entry ID. */
+    public void finishEntry(int entryId, long timestampUs) throws IOException {
+      ByteBuffer payload = ByteBuffer.allocate(5).order(ByteOrder.LITTLE_ENDIAN);
+      payload.put((byte) CONTROL_FINISH);
+      payload.putInt(entryId);
+      writeRecord(0, timestampUs, payload.array());
+      entryIds.values().removeIf(v -> v == entryId);
+    }
+
     public void appendDouble(int entryId, long timestampUs, double value) throws IOException {
       buf8.clear();
       buf8.putDouble(value);
@@ -199,6 +209,11 @@ public final class FluxWpiLogCodec {
       writeStructSchema("Rotation2d", "double value", timestampUs);
       writeStructSchema("Pose2d", "Translation2d translation;Rotation2d rotation", timestampUs);
       writeStructSchema("Translation3d", "double x;double y;double z", timestampUs);
+      writeStructSchema("Quaternion", "double w;double x;double y;double z", timestampUs);
+      writeStructSchema("Rotation3d", "Quaternion q", timestampUs);
+      writeStructSchema("Pose3d", "Translation3d translation;Rotation3d rotation", timestampUs);
+      writeStructSchema("SwerveModuleState", "double speed;Rotation2d angle", timestampUs);
+      writeStructSchema("ChassisSpeeds", "double vx;double vy;double omega", timestampUs);
     }
 
     private void writeStructSchema(String structName, String schemaDef, long timestampUs)
@@ -233,6 +248,53 @@ public final class FluxWpiLogCodec {
         buf.putDouble(v);
       }
       writeRecord(entryId, timestampUs, buf.array());
+    }
+
+    /**
+     * Appends a WPILib {@code struct:Pose3d[]} array ({@code 56 * N} bytes: packed {@code x, y, z,
+     * qw, qx, qy, qz} 7-tuples).
+     */
+    public void appendPose3dArray(int entryId, long timestampUs, double[] pose7Tuples)
+        throws IOException {
+      if (pose7Tuples.length % 7 != 0) {
+        throw new IllegalArgumentException(
+            "Pose3d[] payload must contain multiples of 7 doubles, got " + pose7Tuples.length);
+      }
+      ByteBuffer buf = ByteBuffer.allocate(pose7Tuples.length * 8).order(ByteOrder.LITTLE_ENDIAN);
+      for (double v : pose7Tuples) {
+        buf.putDouble(v);
+      }
+      writeRecord(entryId, timestampUs, buf.array());
+    }
+
+    /**
+     * Appends a WPILib {@code struct:SwerveModuleState[]} array ({@code 16 * N} bytes: packed
+     * {@code speedMps, angleRad} pairs).
+     */
+    public void appendSwerveModuleStateArray(
+        int entryId, long timestampUs, double[] speedAnglePairs) throws IOException {
+      if (speedAnglePairs.length % 2 != 0) {
+        throw new IllegalArgumentException(
+            "SwerveModuleState[] payload must contain multiples of 2 doubles, got "
+                + speedAnglePairs.length);
+      }
+      ByteBuffer buf =
+          ByteBuffer.allocate(speedAnglePairs.length * 8).order(ByteOrder.LITTLE_ENDIAN);
+      for (double v : speedAnglePairs) {
+        buf.putDouble(v);
+      }
+      writeRecord(entryId, timestampUs, buf.array());
+    }
+
+    /** Appends a WPILib {@code struct:ChassisSpeeds} (24 bytes: {@code vx, vy, omega}). */
+    public void appendChassisSpeeds(
+        int entryId, long timestampUs, double vxMps, double vyMps, double omegaRadPerSec)
+        throws IOException {
+      buf24.clear();
+      buf24.putDouble(vxMps);
+      buf24.putDouble(vyMps);
+      buf24.putDouble(omegaRadPerSec);
+      writeRecord(entryId, timestampUs, buf24.array());
     }
 
     public void writeRecord(int entryId, long timestampUs, byte[] payload) throws IOException {
@@ -299,6 +361,7 @@ public final class FluxWpiLogCodec {
     String extraHeader = new String(extraBytes, StandardCharsets.UTF_8);
 
     Map<Integer, EntryDef> entriesById = new LinkedHashMap<>();
+    Map<Integer, EntryDef> activeEntriesById = new LinkedHashMap<>();
     Map<String, EntryDef> entriesByName = new LinkedHashMap<>();
     Map<String, List<DoubleSample>> doubleSeries = new LinkedHashMap<>();
     Map<String, List<LongSample>> intSeries = new LinkedHashMap<>();
@@ -332,15 +395,22 @@ public final class FluxWpiLogCodec {
           String metadata = readStr(buf, nextPos);
           if (name != null && type != null) {
             EntryDef def = new EntryDef(startedId, name, type, metadata != null ? metadata : "");
+            activeEntriesById.put(startedId, def);
             entriesById.put(startedId, def);
             entriesByName.put(name, def);
           }
+        } else if (ctrl == CONTROL_FINISH && buf.remaining() >= 4) {
+          int finishedId = buf.getInt();
+          activeEntriesById.remove(finishedId);
         } else if (ctrl == CONTROL_SET_METADATA && buf.remaining() >= 8) {
           int targetId = buf.getInt();
           String metadata = readStr(buf, nextPos);
-          EntryDef old = entriesById.get(targetId);
+          EntryDef old = activeEntriesById.getOrDefault(targetId, entriesById.get(targetId));
           if (old != null && metadata != null) {
             EntryDef updated = new EntryDef(old.id(), old.name(), old.type(), metadata);
+            if (activeEntriesById.containsKey(targetId)) {
+              activeEntriesById.put(targetId, updated);
+            }
             entriesById.put(targetId, updated);
             entriesByName.put(old.name(), updated);
           }
@@ -355,7 +425,7 @@ public final class FluxWpiLogCodec {
             maxTs = ts;
           }
         }
-        EntryDef def = entriesById.get(entryId);
+        EntryDef def = activeEntriesById.get(entryId);
         if (def != null && isMonotonicTs) {
           String name = def.name();
           String type = def.type();
@@ -373,7 +443,7 @@ public final class FluxWpiLogCodec {
             doubleSeries
                 .computeIfAbsent(name, k -> new ArrayList<>())
                 .add(new DoubleSample(ts, (double) val));
-          } else if ("double[]".equals(type) && payloadSize >= 8 && (payloadSize % 8) == 0) {
+          } else if ("double[]".equals(type) && payloadSize >= 0 && (payloadSize % 8) == 0) {
             int count = payloadSize / 8;
             double[] arr = new double[count];
             for (int i = 0; i < count; i++) {
@@ -435,6 +505,144 @@ public final class FluxWpiLogCodec {
             doubleSeries
                 .computeIfAbsent(name + ".rotRad", k -> new ArrayList<>())
                 .add(new DoubleSample(ts, rotRad));
+            doubleArraySeries
+                .computeIfAbsent(name, k -> new ArrayList<>())
+                .add(new DoubleArraySample(ts, new double[] {px, py, rotRad}));
+          } else if ("struct:Pose2d[]".equals(type)
+              && payloadSize >= 0
+              && (payloadSize % 24) == 0) {
+            int count = payloadSize / 24;
+            double[] vals = new double[count * 3];
+            for (int i = 0; i < vals.length; i++) {
+              vals[i] = buf.getDouble();
+            }
+            doubleSeries
+                .computeIfAbsent(name + ".count", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, count));
+            doubleArraySeries
+                .computeIfAbsent(name, k -> new ArrayList<>())
+                .add(new DoubleArraySample(ts, vals));
+          } else if (("struct:Pose3d".equals(type) || "struct:Transform3d".equals(type))
+              && payloadSize == 56) {
+            double px = buf.getDouble();
+            double py = buf.getDouble();
+            double pz = buf.getDouble();
+            double qw = buf.getDouble();
+            double qx = buf.getDouble();
+            double qy = buf.getDouble();
+            double qz = buf.getDouble();
+            doubleSeries
+                .computeIfAbsent(name + ".x", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, px));
+            doubleSeries
+                .computeIfAbsent(name + ".y", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, py));
+            doubleSeries
+                .computeIfAbsent(name + ".z", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, pz));
+            doubleSeries
+                .computeIfAbsent(name + ".qw", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, qw));
+            doubleSeries
+                .computeIfAbsent(name + ".qx", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, qx));
+            doubleSeries
+                .computeIfAbsent(name + ".qy", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, qy));
+            doubleSeries
+                .computeIfAbsent(name + ".qz", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, qz));
+            doubleArraySeries
+                .computeIfAbsent(name, k -> new ArrayList<>())
+                .add(new DoubleArraySample(ts, new double[] {px, py, pz, qw, qx, qy, qz}));
+          } else if (("struct:Pose3d[]".equals(type) || "struct:Transform3d[]".equals(type))
+              && payloadSize >= 0
+              && (payloadSize % 56) == 0) {
+            int count = payloadSize / 56;
+            double[] vals = new double[count * 7];
+            for (int i = 0; i < vals.length; i++) {
+              vals[i] = buf.getDouble();
+            }
+            doubleSeries
+                .computeIfAbsent(name + ".count", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, count));
+            doubleArraySeries
+                .computeIfAbsent(name, k -> new ArrayList<>())
+                .add(new DoubleArraySample(ts, vals));
+          } else if ("struct:SwerveModuleState".equals(type) && payloadSize == 16) {
+            double speed = buf.getDouble();
+            double angleRad = buf.getDouble();
+            doubleSeries
+                .computeIfAbsent(name + ".speed", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, speed));
+            doubleSeries
+                .computeIfAbsent(name + ".angleRad", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, angleRad));
+            doubleArraySeries
+                .computeIfAbsent(name, k -> new ArrayList<>())
+                .add(new DoubleArraySample(ts, new double[] {speed, angleRad}));
+          } else if ("struct:SwerveModuleState[]".equals(type)
+              && payloadSize >= 0
+              && (payloadSize % 16) == 0) {
+            int count = payloadSize / 16;
+            double[] vals = new double[count * 2];
+            for (int i = 0; i < count; i++) {
+              double speed = buf.getDouble();
+              double angleRad = buf.getDouble();
+              vals[i * 2] = speed;
+              vals[i * 2 + 1] = angleRad;
+              doubleSeries
+                  .computeIfAbsent(name + "[" + i + "].speed", k -> new ArrayList<>())
+                  .add(new DoubleSample(ts, speed));
+              doubleSeries
+                  .computeIfAbsent(name + "[" + i + "].angleRad", k -> new ArrayList<>())
+                  .add(new DoubleSample(ts, angleRad));
+            }
+            doubleSeries
+                .computeIfAbsent(name + ".count", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, count));
+            doubleArraySeries
+                .computeIfAbsent(name, k -> new ArrayList<>())
+                .add(new DoubleArraySample(ts, vals));
+          } else if ("struct:SwerveModulePosition[]".equals(type)
+              && payloadSize >= 0
+              && (payloadSize % 16) == 0) {
+            int count = payloadSize / 16;
+            double[] vals = new double[count * 2];
+            for (int i = 0; i < count; i++) {
+              double distance = buf.getDouble();
+              double angleRad = buf.getDouble();
+              vals[i * 2] = distance;
+              vals[i * 2 + 1] = angleRad;
+              doubleSeries
+                  .computeIfAbsent(name + "[" + i + "].distance", k -> new ArrayList<>())
+                  .add(new DoubleSample(ts, distance));
+              doubleSeries
+                  .computeIfAbsent(name + "[" + i + "].angleRad", k -> new ArrayList<>())
+                  .add(new DoubleSample(ts, angleRad));
+            }
+            doubleSeries
+                .computeIfAbsent(name + ".count", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, count));
+            doubleArraySeries
+                .computeIfAbsent(name, k -> new ArrayList<>())
+                .add(new DoubleArraySample(ts, vals));
+          } else if ("struct:ChassisSpeeds".equals(type) && payloadSize == 24) {
+            double vx = buf.getDouble();
+            double vy = buf.getDouble();
+            double omega = buf.getDouble();
+            doubleSeries
+                .computeIfAbsent(name + ".vx", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, vx));
+            doubleSeries
+                .computeIfAbsent(name + ".vy", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, vy));
+            doubleSeries
+                .computeIfAbsent(name + ".omega", k -> new ArrayList<>())
+                .add(new DoubleSample(ts, omega));
+            doubleArraySeries
+                .computeIfAbsent(name, k -> new ArrayList<>())
+                .add(new DoubleArraySample(ts, new double[] {vx, vy, omega}));
           } else if ("struct:Translation3d[]".equals(type)
               && payloadSize >= 0
               && payloadSize % 24 == 0) {

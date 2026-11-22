@@ -122,6 +122,7 @@ public final class FluxFigTest {
       testRoboRio2SnapshotCaptureParsingAndEvaluation();
       testHardwareSafetyValidatorBypassesClosed();
       testMultiConfigPresetsActiveProfileChannelAndTargetedCellTuning();
+      testWpiLogControlFinishAndExtendedStructTypes();
       System.out.println("FluxFigTest: ALL TESTS PASSED");
     } finally {
       cleanupTempPaths();
@@ -1613,5 +1614,68 @@ public final class FluxFigTest {
       rejectedStructuralCell = true;
     }
     check(rejectedStructuralCell, "registerTunableTableCell must reject statorLimitAmps");
+  }
+
+  private static void testWpiLogControlFinishAndExtendedStructTypes() throws Exception {
+    Path logFile = createTempFile("fluxfig-wpilog-structs-", ".wpilog");
+    try (FluxWpiLogCodec.Writer writer = new FluxWpiLogCodec.Writer(logFile, "STRUCTS")) {
+      writer.registerStandardGeometrySchemas(0L);
+      int tempId = writer.startEntry("/Temp/Metric", "double", "", 1_000L);
+      writer.appendDouble(tempId, 2_000L, 1.25);
+      writer.finishEntry(tempId, 3_000L);
+      writer.appendDouble(tempId, 4_000L, 99.0);
+
+      int pose3dArrId = writer.startEntry("/Vision/TagPoses", "struct:Pose3d[]", "", 1_000L);
+      int swerveArrId =
+          writer.startEntry("/Drive/MeasuredStates", "struct:SwerveModuleState[]", "", 1_000L);
+      int speedsId = writer.startEntry("/Drive/ChassisSpeeds", "struct:ChassisSpeeds", "", 1_000L);
+
+      writer.appendPose3dArray(
+          pose3dArrId,
+          10_000L,
+          new double[] {1.0, 2.0, 0.5, 1.0, 0.0, 0.0, 0.0, 3.0, 4.0, 1.2, 0.707, 0.0, 0.0, 0.707});
+      writer.appendPose3dArray(pose3dArrId, 20_000L, new double[0]);
+      writer.appendSwerveModuleStateArray(
+          swerveArrId, 10_000L, new double[] {2.5, 0.1, 2.6, 0.2, 2.4, -0.1, 2.55, 0.0});
+      writer.appendChassisSpeeds(speedsId, 10_000L, 3.1, -0.4, 1.25);
+    }
+
+    FluxWpiLogCodec.ParsedLog parsed = FluxWpiLogCodec.read(logFile);
+    check(
+        parsed.getDoubleSeries("/Temp/Metric").size() == 1
+            && Math.abs(parsed.getDoubleSeries("/Temp/Metric").get(0).value() - 1.25) < 1e-6,
+        "CONTROL_FINISH must stop attributing samples to finished entry ID");
+
+    check(
+        parsed.getDoubleSeries("/Vision/TagPoses.count").size() == 2
+            && Math.abs(parsed.getDoubleSeries("/Vision/TagPoses.count").get(0).value() - 2.0)
+                < 1e-6
+            && Math.abs(parsed.getDoubleSeries("/Vision/TagPoses.count").get(1).value() - 0.0)
+                < 1e-6,
+        "Expected struct:Pose3d[] counts 2 then 0");
+    check(
+        parsed.getDoubleArraySeries("/Vision/TagPoses").get(0).values().length == 14
+            && Math.abs(parsed.getDoubleArraySeries("/Vision/TagPoses").get(0).values()[9] - 1.2)
+                < 1e-6,
+        "Expected 14 unpacked Pose3d[] doubles");
+
+    check(
+        Math.abs(parsed.getDoubleSeries("/Drive/MeasuredStates.count").get(0).value() - 4.0) < 1e-6
+            && Math.abs(
+                    parsed.getDoubleSeries("/Drive/MeasuredStates[1].speed").get(0).value() - 2.6)
+                < 1e-6
+            && Math.abs(
+                    parsed.getDoubleSeries("/Drive/MeasuredStates[2].angleRad").get(0).value()
+                        + 0.1)
+                < 1e-6,
+        "Expected struct:SwerveModuleState[] indexed speed and angleRad series");
+
+    check(
+        Math.abs(parsed.getDoubleSeries("/Drive/ChassisSpeeds.vx").get(0).value() - 3.1) < 1e-6
+            && Math.abs(parsed.getDoubleSeries("/Drive/ChassisSpeeds.vy").get(0).value() + 0.4)
+                < 1e-6
+            && Math.abs(parsed.getDoubleSeries("/Drive/ChassisSpeeds.omega").get(0).value() - 1.25)
+                < 1e-6,
+        "Expected struct:ChassisSpeeds vx/vy/omega series");
   }
 }
